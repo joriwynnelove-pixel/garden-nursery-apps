@@ -149,3 +149,21 @@ unsent — so ticks update the screen at once, a refused write is rolled back wi
 they do everywhere else.
 
 **UX notes and improvement ideas:** [`docs/ux-review.md`](../../docs/ux-review.md).
+
+## This fork's additions (not in upstream)
+
+This copy carries two features that John's upstream does not. Keep them when merging his releases;
+both live entirely in `js/plants-view.js` and a marked block at the end of `styles.css`.
+
+- **Plant tags.** Five multi-select fields on the `plants` document — `type`, `sunNeeds`,
+  `waterNeeds`, `traits`, `tolerances` (arrays of strings). The option lists are the `*_OPTIONS`
+  constants at the top of `plants-view.js`; every form, filter and detail view reads them from
+  there. Shown as pill buttons on the plant form, as badges under "Growing Conditions & Traits" on
+  plant detail, and as a filter panel (funnel button in the Plants search bar). Within a category
+  a filter matches ANY selected tag; across categories a plant must match EVERY active category.
+  No rules change — they are ordinary fields on an existing collection.
+- **Wishlist.** An ordinary area named `Wishlist` (case-insensitive) stands for plants wanted but
+  not owned. `ownershipStatusFromAreas()` treats a plant as Wishlist only when that area is its
+  *only* location; no location, or any real area, counts as Owned. Wishlist plants get an amber
+  card banner and a "♡ Wishlist" badge, and the filter panel has an All / Owned / Wishlist switch.
+  Nothing is stored for this — it is derived from `instances` + `areas` at render time.

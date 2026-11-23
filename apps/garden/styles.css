@@ -2938,3 +2938,138 @@ textarea::placeholder {
 /* Three footer buttons must fit a 320px phone: trim padding, never wrap a label */
 .wr-footer-buttons      { gap: 6px; }
 .wr-footer-buttons .btn { padding-left: 6px; padding-right: 6px; white-space: nowrap; font-size: 0.88rem; }
+
+/* =============================================================
+   Plant tags + Wishlist (Jori's additions)
+   ============================================================= */
+
+/* --- Pill multi-select (Sun/Water/Type/Traits/Tolerances) --- */
+.pill-select {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+}
+.pill-option input[type="checkbox"] {
+    position: absolute;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    pointer-events: none;
+}
+.pill-option label {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.82rem;
+    font-weight: 500;
+    padding: 6px 13px;
+    border-radius: 100px;
+    border: 1.5px solid var(--grey-200);
+    background: var(--white);
+    color: var(--grey-600);
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: background var(--transition), color var(--transition), border-color var(--transition);
+    text-transform: none;
+    letter-spacing: 0;
+}
+.pill-option input[type="checkbox"]:checked + label {
+    background: var(--green-700);
+    border-color: var(--green-700);
+    color: var(--white);
+}
+.pill-option input[type="checkbox"]:focus-visible + label {
+    outline: 2px solid var(--green-500);
+    outline-offset: 1px;
+}
+
+/* --- Plant list: filter toggle + panel --- */
+.filter-toggle-btn {
+    position: absolute;
+    right: 38px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: var(--grey-400);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    border-radius: 50%;
+    transition: color var(--transition), background var(--transition);
+    -webkit-tap-highlight-color: transparent;
+}
+.filter-toggle-btn:hover { background: var(--grey-100); color: var(--grey-600); }
+.filter-toggle-btn.active { color: var(--green-700); }
+.filter-count-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: var(--green-700);
+    color: var(--white);
+    font-size: 0.62rem;
+    font-weight: 700;
+    min-width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    align-items: center;
+    justify-content: center;
+    padding: 0 3px;
+}
+.filter-panel {
+    background: var(--white);
+    border: 1.5px solid var(--grey-200);
+    border-radius: var(--radius-md);
+    padding: 14px;
+    margin: -4px 0 14px;
+    box-shadow: var(--shadow-sm);
+}
+.filter-group { margin-bottom: 14px; }
+.filter-group:last-of-type { margin-bottom: 10px; }
+.filter-group-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--grey-600);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 7px;
+}
+
+/* --- Segmented control (e.g. Ownership: All / Owned / Wishlist) --- */
+.segmented-control {
+    display: inline-flex;
+    border: 1.5px solid var(--grey-200);
+    border-radius: 100px;
+    overflow: hidden;
+}
+.segmented-option {
+    background: var(--white);
+    border: none;
+    padding: 6px 14px;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--grey-600);
+    cursor: pointer;
+    font-family: inherit;
+    transition: background var(--transition), color var(--transition);
+    -webkit-tap-highlight-color: transparent;
+}
+.segmented-option + .segmented-option { border-left: 1.5px solid var(--grey-200); }
+.segmented-option.active { background: var(--green-700); color: var(--white); }
+#ownership-filter-group .form-hint { margin-top: 6px; }
+
+/* --- Wishlist plant cards --- */
+.plant-card--wishlist .plant-card-banner { background: var(--amber); }
+
+/* --- Tag badges shown on plant detail view --- */
+.tag-badge-row {
+    display: flex !important;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.tag-badge-row .card-badge {
+    background: var(--green-100);
+    color: var(--green-800);
+}

@@ -32,6 +32,78 @@ function todayISO() {
 }
 
 // =============================================
+//  TAG / DROPDOWN OPTION LISTS
+//  Edit these arrays to add, remove, or rename options —
+//  every form, filter, and detail view pulls from here.
+// =============================================
+
+const TYPE_OPTIONS      = ['Annual', 'Perennial', 'Tree', 'Shrub', 'Groundcover', 'Vine'];
+const SUN_OPTIONS       = ['Full Sun', 'Part Sun', 'Morning Sun', 'Shade'];
+const WATER_OPTIONS     = ['Dry', 'Well Drained but Moist', 'Wet'];
+const TRAIT_OPTIONS     = [
+    'Self Sowing', 'Flowering', 'Fall Color', 'Toxic to Pets', 'Toxic to People',
+    'Pruning Friendly', 'Rare/Endangered', 'Texture/Leaf Interest', 'Texture/Bark Interest',
+    'Medicinal', 'Edible', 'Fragrant', 'Year Round Interest', 'Pollinator Friendly', 'Cut Flower',
+];
+const TOLERANCE_OPTIONS = ['Flooding', 'Frost', 'Heat', 'Drought', 'Deer', 'Heavy Soils', 'Acidic Soil'];
+
+// =============================================
+//  OWNERSHIP STATUS (Owned vs Wishlist)
+//  Detected automatically from garden locations — no extra field to fill in.
+//  A plant counts as "Wishlist" only if every location it's assigned to is
+//  the virtual area named "Wishlist" (case-insensitive). A plant with no
+//  locations yet, or with at least one *real* area, counts as "Owned".
+// =============================================
+const WISHLIST_AREA_NAME = 'wishlist';
+
+function ownershipStatusFromAreas(areaNames = []) {
+    if (!areaNames || areaNames.length === 0) return 'owned';
+    const hasRealArea = areaNames.some(n => (n || '').trim().toLowerCase() !== WISHLIST_AREA_NAME);
+    return hasRealArea ? 'owned' : 'wishlist';
+}
+
+// Categories used for both the plant form and the list-view filter panel.
+const TAG_CATEGORIES = [
+    { key: 'type',        label: 'Type',                   options: TYPE_OPTIONS },
+    { key: 'sunNeeds',    label: 'Sun needs',               options: SUN_OPTIONS },
+    { key: 'waterNeeds',  label: 'Water / drainage needs',  options: WATER_OPTIONS },
+    { key: 'traits',      label: 'Traits',                  options: TRAIT_OPTIONS },
+    { key: 'tolerances',  label: 'Tolerances',              options: TOLERANCE_OPTIONS },
+];
+
+/** Renders a row of toggleable pill checkboxes for a multi-select field. */
+function pillSelectGroup(name, options, selectedValues = [], idPrefix = null) {
+    const prefix = idPrefix || name;
+    return `
+        <div class="pill-select">
+            ${options.map((opt, i) => {
+                const id = `${prefix}-${i}`;
+                const checked = selectedValues.includes(opt) ? 'checked' : '';
+                return `
+                    <span class="pill-option">
+                        <input type="checkbox" id="${id}" name="${name}" value="${escHtml(opt)}" ${checked}>
+                        <label for="${id}">${escHtml(opt)}</label>
+                    </span>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
+/** Renders a read-only field-row of tag badges for the plant detail view. Returns '' if empty. */
+function tagBadgeRow(label, values) {
+    if (!Array.isArray(values) || values.length === 0) return '';
+    return `
+        <div class="field-row">
+            <span class="field-label">${escHtml(label)}</span>
+            <span class="field-value tag-badge-row">
+                ${values.map(v => `<span class="card-badge">${escHtml(v)}</span>`).join('')}
+            </span>
+        </div>
+    `;
+}
+
+// =============================================
 //  PLANTS LIST
 // =============================================
 
@@ -88,33 +160,78 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
     let query = savedPlantQuery;
     let debounceTimer = null;
 
+    // Tag filters — { type: [...], sunNeeds: [...], waterNeeds: [...], traits: [...], tolerances: [...] }
+    const activeFilters = Object.fromEntries(TAG_CATEGORIES.map(c => [c.key, []]));
+    let ownershipFilter = 'all'; // 'all' | 'owned' | 'wishlist'
+    const activeFilterCount = () =>
+        Object.values(activeFilters).reduce((n, arr) => n + arr.length, 0) + (ownershipFilter !== 'all' ? 1 : 0);
+
     container.innerHTML = `
         <div class="search-bar">
             <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <input class="search-input" id="plant-search" placeholder="Search by name, genus, species…"
-                   autocomplete="off" value="${query.replace(/"/g, '&quot;')}">
+                   autocomplete="off" value="${query.replace(/"/g, '&quot;')}" style="padding-right:78px;">
             <button class="search-clear" id="search-clear-btn" title="Clear search" aria-label="Clear search">✕</button>
+            <button class="filter-toggle-btn" id="plant-filter-toggle" title="Filter by tags" aria-label="Filter by tags">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+                <span id="plant-filter-count" class="filter-count-badge" style="display:none;"></span>
+            </button>
+        </div>
+        <div id="plant-filter-panel" class="filter-panel" style="display:none;">
+            <div class="filter-group" id="ownership-filter-group">
+                <div class="filter-group-title">Ownership</div>
+                <div class="segmented-control" id="ownership-segmented">
+                    <button type="button" class="segmented-option active" data-value="all">All</button>
+                    <button type="button" class="segmented-option" data-value="owned">Owned</button>
+                    <button type="button" class="segmented-option" data-value="wishlist">Wishlist</button>
+                </div>
+                <div class="form-hint">Wishlist = only assigned to your virtual "Wishlist" area</div>
+            </div>
+            ${TAG_CATEGORIES.map(cat => `
+                <div class="filter-group" data-category="${cat.key}">
+                    <div class="filter-group-title">${escHtml(cat.label)}</div>
+                    ${pillSelectGroup(`flt-${cat.key}`, cat.options, [], `flt-${cat.key}`)}
+                </div>
+            `).join('')}
+            <div style="display:flex;justify-content:flex-end;margin-top:4px;">
+                <button type="button" class="btn btn-sm btn-secondary" id="plant-filter-clear">Clear filters</button>
+            </div>
         </div>
         <div id="plant-results"></div>
     `;
 
     const filtered = () => plants.filter(p => {
         const q = query.toLowerCase().trim();
-        if (!q) return true;
+        if (q) {
+            // Split into individual words so multi-word queries like "Acer palmatum"
+            // work across fields — every word must match at least one field,
+            // but each word can match a *different* field.
+            const words = q.split(/\s+/);
+            const fields = [
+                (p.genus       || '').toLowerCase(),
+                (p.species     || '').toLowerCase(),
+                (p.cultivar    || '').toLowerCase(),
+                (p.subspecies  || '').toLowerCase(),
+                (p.variety     || '').toLowerCase(),
+                (p.commonName  || '').toLowerCase(),
+            ];
+            if (!words.every(word => fields.some(field => field.includes(word)))) return false;
+        }
 
-        // Split into individual words so multi-word queries like "Acer palmatum"
-        // work across fields — every word must match at least one field,
-        // but each word can match a *different* field.
-        const words = q.split(/\s+/);
-        const fields = [
-            (p.genus       || '').toLowerCase(),
-            (p.species     || '').toLowerCase(),
-            (p.cultivar    || '').toLowerCase(),
-            (p.subspecies  || '').toLowerCase(),
-            (p.variety     || '').toLowerCase(),
-            (p.commonName  || '').toLowerCase(),
-        ];
-        return words.every(word => fields.some(field => field.includes(word)));
+        if (ownershipFilter !== 'all') {
+            if (ownershipStatusFromAreas(plantAreaNames[p.id] || []) !== ownershipFilter) return false;
+        }
+
+        // Tag filters — within a category, a plant matches if it has ANY selected tag (OR).
+        // Across categories, a plant must match EVERY category that has an active selection (AND).
+        for (const cat of TAG_CATEGORIES) {
+            const selected = activeFilters[cat.key];
+            if (selected.length === 0) continue;
+            const plantValues = Array.isArray(p[cat.key]) ? p[cat.key] : [];
+            if (!selected.some(v => plantValues.includes(v))) return false;
+        }
+
+        return true;
     });
 
     const renderResults = () => {
@@ -130,8 +247,8 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
             ${list.length === 0 ? `
                 <div class="empty-state">
                     <div class="empty-state-icon">🌱</div>
-                    <h3>${query ? 'No plants found' : 'No plants yet'}</h3>
-                    <p>${query ? 'Try a different search term.' : 'Tap the + button to add your first plant.'}</p>
+                    <h3>${query || activeFilterCount() > 0 ? 'No plants found' : 'No plants yet'}</h3>
+                    <p>${query || activeFilterCount() > 0 ? 'Try a different search term or fewer filters.' : 'Tap the + button to add your first plant.'}</p>
                 </div>
             ` : `
                 <div class="card-grid">
@@ -162,6 +279,57 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
 
     const searchInput = container.querySelector('#plant-search');
     const clearBtn    = container.querySelector('#search-clear-btn');
+    const filterToggle = container.querySelector('#plant-filter-toggle');
+    const filterPanel  = container.querySelector('#plant-filter-panel');
+    const filterCountEl = container.querySelector('#plant-filter-count');
+
+    function syncFilterCount() {
+        const n = activeFilterCount();
+        filterToggle.classList.toggle('active', n > 0);
+        filterCountEl.style.display = n > 0 ? 'flex' : 'none';
+        filterCountEl.textContent = n;
+    }
+
+    filterToggle.addEventListener('click', () => {
+        const showing = filterPanel.style.display !== 'none';
+        filterPanel.style.display = showing ? 'none' : '';
+    });
+
+    filterPanel.querySelectorAll('.filter-group').forEach(group => {
+        const cat = group.dataset.category;
+        if (!cat) return; // the Ownership group has no checkboxes
+        group.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.addEventListener('change', () => {
+                const checked = Array.from(group.querySelectorAll('input:checked')).map(c => c.value);
+                activeFilters[cat] = checked;
+                syncFilterCount();
+                renderResults();
+            });
+        });
+    });
+
+    const ownershipSegmented = container.querySelector('#ownership-segmented');
+    ownershipSegmented.querySelectorAll('.segmented-option').forEach(btn => {
+        btn.addEventListener('click', () => {
+            ownershipFilter = btn.dataset.value;
+            ownershipSegmented.querySelectorAll('.segmented-option').forEach(b =>
+                b.classList.toggle('active', b === btn)
+            );
+            syncFilterCount();
+            renderResults();
+        });
+    });
+
+    container.querySelector('#plant-filter-clear').addEventListener('click', () => {
+        filterPanel.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => cb.checked = false);
+        TAG_CATEGORIES.forEach(cat => activeFilters[cat.key] = []);
+        ownershipFilter = 'all';
+        ownershipSegmented.querySelectorAll('.segmented-option').forEach(b =>
+            b.classList.toggle('active', b.dataset.value === 'all')
+        );
+        syncFilterCount();
+        renderResults();
+    });
 
     function syncClearBtn() {
         clearBtn.style.display = searchInput.value ? 'flex' : 'none';
@@ -196,6 +364,7 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
 
 function plantCard(plant, hasPhotos = false, areaNames = []) {
     const name = formatBotanicalName(plant);
+    const isWishlist = ownershipStatusFromAreas(areaNames) === 'wishlist';
     let locationLine = '';
     if (areaNames.length === 1) {
         locationLine = `<span class="plant-card-location">📍 ${escHtml(areaNames[0])}</span>`;
@@ -205,13 +374,17 @@ function plantCard(plant, hasPhotos = false, areaNames = []) {
         locationLine = `<span class="plant-card-location plant-card-location--unplaced">Not placed</span>`;
     }
     return `
-        <div class="card plant-card" data-id="${plant.id}">
+        <div class="card plant-card${isWishlist ? ' plant-card--wishlist' : ''}" data-id="${plant.id}">
             <div class="plant-card-banner"></div>
             <div class="card-body">
                 <div class="card-title">${name || '<span class="text-muted">Unnamed plant</span>'}</div>
                 ${plant.commonName ? `<div class="card-subtitle">${escHtml(plant.commonName)}</div>` : ''}
                 <div class="card-meta">
+                    ${isWishlist ? `<span class="card-badge" style="background:var(--amber);color:var(--white);">♡ Wishlist</span>` : ''}
                     ${plant.genus ? `<button class="card-badge genus-badge" data-genus="${escHtml(plant.genus)}" title="Show all ${escHtml(plant.genus)}">${escHtml(plant.genus)}</button>` : ''}
+                    ${Array.isArray(plant.type) && plant.type.length ? plant.type.map(t =>
+                        `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);">${escHtml(t)}</span>`
+                    ).join('') : ''}
                     ${plant.dateAcquired ? `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);">📅 ${escHtml(plant.dateAcquired)}</span>` : ''}
                     ${hasPhotos ? `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);" title="Has photos">📷</span>` : ''}
                 </div>
@@ -466,6 +639,14 @@ function buildPlantDetailHTML(plant, instances, photos) {
             `).join('')}
             ${nomenclatureRows.length === 0 ? '<p class="text-muted" style="font-size:0.9rem">No details recorded yet.</p>' : ''}
         </div>
+
+        <!-- Growing Conditions & Traits -->
+        ${(TAG_CATEGORIES.some(c => Array.isArray(plant[c.key]) && plant[c.key].length)) ? `
+        <div class="detail-section">
+            <div class="detail-section-title">Growing Conditions & Traits</div>
+            ${TAG_CATEGORIES.map(c => tagBadgeRow(c.label, plant[c.key])).join('')}
+        </div>
+        ` : ''}
 
         <!-- Notes & Care -->
         ${(plant.notes || plant.careReminders) ? `
@@ -1008,6 +1189,11 @@ export async function showPlantForm(plant, onSave, preselectedAreaId = null, opt
             height:       fd.get('height').trim(),
             notes:        fd.get('notes').trim(),
             careReminders: fd.get('careReminders').trim(),
+            type:         fd.getAll('type'),
+            sunNeeds:     fd.getAll('sunNeeds'),
+            waterNeeds:   fd.getAll('waterNeeds'),
+            traits:       fd.getAll('traits'),
+            tolerances:   fd.getAll('tolerances'),
         };
 
         // Capture files + location before modal closes (gallery + camera)
@@ -1076,6 +1262,7 @@ function buildPlantFormHTML(plant, areas = [], photos = [], preselectedAreaId = 
     plant = plant || {};
     const isEdit = !!(plant && plant.id);
     const v = (key) => escHtml(plant[key] || '');
+    const selArr = (key) => Array.isArray(plant[key]) ? plant[key] : [];
     // Effective hybrid type (legacy boolean hybrid → interspecific)
     const ht = plant.hybridType || (plant.hybrid ? 'interspecific' : '');
     return `
@@ -1153,6 +1340,11 @@ function buildPlantFormHTML(plant, areas = [], photos = [], preselectedAreaId = 
                 </div>
             </div>
 
+            <div class="form-group">
+                <label class="form-label">Type <span class="optional">optional</span></label>
+                ${pillSelectGroup('type', TYPE_OPTIONS, selArr('type'))}
+            </div>
+
             <div class="form-section-label">Notes & Care</div>
 
             <div class="form-group">
@@ -1163,6 +1355,26 @@ function buildPlantFormHTML(plant, areas = [], photos = [], preselectedAreaId = 
             <div class="form-group">
                 <label class="form-label" for="careReminders">Care reminders <span class="optional">optional</span></label>
                 <textarea class="form-textarea" id="careReminders" name="careReminders" placeholder="Pruning, feeding, watering notes…">${v('careReminders')}</textarea>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Sun needs <span class="optional">optional</span></label>
+                ${pillSelectGroup('sunNeeds', SUN_OPTIONS, selArr('sunNeeds'))}
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Water / drainage needs <span class="optional">optional</span></label>
+                ${pillSelectGroup('waterNeeds', WATER_OPTIONS, selArr('waterNeeds'))}
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Traits <span class="optional">optional</span></label>
+                ${pillSelectGroup('traits', TRAIT_OPTIONS, selArr('traits'))}
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Tolerances <span class="optional">optional</span></label>
+                ${pillSelectGroup('tolerances', TOLERANCE_OPTIONS, selArr('tolerances'))}
             </div>
 
             ${!isEdit ? `
