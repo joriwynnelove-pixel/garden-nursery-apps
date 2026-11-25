@@ -14,7 +14,7 @@ Two Progressive Web Apps, one Firebase project, one repo, two Netlify sites.
 |---|---|---|
 | What it does | Plant collection, areas, tasks, irrigation, blog/journal, compost bin | Propagation batches from sowing to planted-out, given-away or lost |
 | Folder | `apps/garden/` | `apps/nursery/` |
-| JS modules | 16 | 22 |
+| JS modules | 18 | 25 |
 | Netlify site | #1 | #2 |
 
 - **Firebase project:** one project — Firestore + Storage + Auth — **shared by both apps**. Which
@@ -83,9 +83,9 @@ garden-apps/
 │   │   ├── icons/            ← 3 PNGs
 │   │   ├── functions/         ← 2 Netlify functions, both calling Gemini:
 │   │   │                        scan-label.js · lookup-plant.js
-│   │   └── js/               ← 16 ES modules
+│   │   └── js/               ← 18 ES modules
 │   │
-│   └── nursery/              ← Netlify site #2. Same shape, 22 JS modules.
+│   └── nursery/              ← Netlify site #2. Same shape, 25 JS modules.
 │
 ├── firebase/                 ← deployed by the Firebase CLI, NOT served by Netlify
 │   ├── firebase.json         ← .firebaserc sits here too, but is gitignored:
@@ -95,6 +95,9 @@ garden-apps/
 │   └── cors.json
 │
 ├── docs/                     ← design notes, specs, the restructure plan
+├── tests/                    ← node --test, no npm. Covers the pure modules only:
+│                                garden-logic.js, and Nursery's pretreatment.js,
+│                                germination.js and plant-match.js. See rule 9.
 └── tools/
     ├── build.mjs             ← THE build: copies /shared, generates the two config files
     ├── check-public.mjs      ← "have I released what I merged?" Merging publishes
@@ -170,6 +173,62 @@ done. `js/auth.js` and `functions/scan-label.js` are still byte-identical copies
 `js/ui-utils.js` is close, with `tools/check-drift.mjs` diffing them and reporting divergence. The
 `cp` build command now exists, so hoisting those into `/shared` too is a small follow-on whenever
 it is worth doing.
+
+### Offline
+
+Added 2026-11. Three pieces, and they only work together:
+
+- **Firestore's persistent cache** (`initFirebase()` in each `db.js`). Reads fall back to the
+  copy in IndexedDB; writes made offline are stored there and sent later, across restarts.
+- **`queued()` in each `db.js`**, which every write goes through. Firestore's write promise settles
+  only when the *server* has the write, so an awaited save would hang offline. `queued()` waits five
+  seconds (0.3 if the browser already knows it is offline) and then lets the caller continue. The
+  file's own `addDoc`/`setDoc`/`updateDoc`/`deleteDoc` shadow Firestore's, so **a new write function
+  needs nothing special — but never import Firestore's write functions anywhere else**, or that
+  write will hang offline. `auth.js` is the one exception and deliberately does not await.
+- **The service worker** caches the Firebase SDK and the other CDN libraries, without which the
+  app cannot start offline at all.
+
+**Writes that belong together use `commitTogether()`** (added 2026-11-10, same block of each
+`db.js`): a Firestore batch, so all of them happen or none do, and it goes through `queued()` like
+any single write. `deleteTogether()` is the same for a parent and its children, parent last. A new
+function that makes two or more writes for one user action should use one of them rather than
+awaiting writes in sequence. A batch is refused whole if the rules refuse any one write in it.
+
+### Remembered collections
+
+Added 2026-11-10. `whole(name, fetch)` in each `db.js` keeps a whole-collection read in memory, and
+the plain getters (`getPlants()`, `getAreas()`, `getNurseryBatches()` …) go through it. A copy is
+dropped when this app writes to that collection, when the page returns to the foreground, when the
+connection returns, and after two minutes.
+
+- **Dropping on write is automatic**, because the shadowed `addDoc`/`setDoc`/`updateDoc`/`deleteDoc`
+  and `commitTogether()` do it from the reference they are handed. A new write function needs
+  nothing special.
+- **A new whole-collection getter should go through `whole()`**, keyed by the collection's real
+  name, or writes will not drop it.
+- **Only whole collections are kept.** One document, or one plant's or one batch's records, is read
+  from Firestore each time. Several of those feed a read-then-write (`recomputeBatchState()`), where
+  a stale read would be written back.
+- **Callers get shallow copies**, so a view may sort or change what it is given.
+- **A change made in the other app or on another device shows after one of the drops above**, not
+  on the next tap. That is the trade.
+
+Garden also has `countOf()`, which asks the server for a count and falls back to counting the
+device's copy when offline.
+
+Two things to keep in mind when changing a view:
+
+- **Offline, a collection this device has never fetched reads as empty, not as an error.** A screen
+  that totals several collections can therefore show a partial figure. That is inherent to the
+  cache; do not "fix" it by treating empty as failure.
+- **A write the rules refuse can no longer fail its form once `queued()` has let go.** It raises a
+  `write-failed` event, which `initSyncIndicator()` in `ui-utils.js` turns into a toast. Online,
+  refusals arrive inside the wait and fail the form as before.
+
+The app's own files are still network-first. Serving them cache-first would make slow-signal
+launches faster, but a page that loads a mix of modules from two different deploys is a blank screen, so it
+needs versioned precaching first. Not done.
 
 ### Role system
 
@@ -279,8 +338,8 @@ composite indexes or fight Netlify.
 
 ## Standing rules
 
-1. **`node --check` every JS file after generating or moving any of them.** All 46: 16 Garden
-   modules, 22 Nursery modules, 2 `functions/scan-label.js`, 2 `functions/lookup-plant.js`, and the
+1. **`node --check` every JS file after generating or moving any of them.** All 51: 18 Garden
+   modules, 25 Nursery modules, 2 `functions/scan-label.js`, 2 `functions/lookup-plant.js`, and the
    4 scripts in `tools/`. If it reports an error, treat it as real — never dismiss it as a false
    alarm. One command covers the lot:
 
@@ -316,6 +375,24 @@ composite indexes or fight Netlify.
    app works; a preview URL keeps serving the last **successful** build, so a failed deploy still
    loads happily; and for anything visual, serve over HTTP — `file://` blocks cross-directory CSS
    and reports a false "everything is broken".
+8. **End every shipping step with one status line.** Two remotes (`origin` and `public`), two
+   sites, and previews versus production make it easy to lose track of where a change actually
+   is. After opening a PR, merging, deploying or publishing, say where things stand in one line,
+   for example: *PR #43 merged · Garden live (Published) · Nursery skipped, no change · not yet
+   pushed to `public`*. Check each part rather than assuming it.
+9. **Run the tests before pushing a change to dates, names, escaping, tag codes, pre-sowing
+   treatment, germination or plant matching.** Node's own test runner; nothing to install:
+
+   ```
+   node --test "tests/*.test.mjs"
+   ```
+
+   Keep the quotes: Node expands the pattern itself, which works the same in PowerShell and Git
+   Bash. The tests only reach modules with no imports — `garden-logic.js` in Garden, and
+   `pretreatment.js`, `germination.js` and `plant-match.js` in Nursery — so logic worth
+   testing belongs in one of those, not in a `db.js` or a view. To check another time zone, set
+   `TZ` in PowerShell (`$env:TZ = 'Pacific/Auckland'`); Git Bash does not pass `TZ` on to
+   Windows programs, so setting it there silently tests your own zone.
 
 ---
 
@@ -343,6 +420,13 @@ Each app's `netlify.toml` carries an `ignore` command so a push only rebuilds th
 changed. **A base directory does not scope builds on its own** — Netlify rebuilds every connected
 site on any push unless you add this. If you ever change one, verify both directions: touch a Garden
 file and confirm Nursery skips, then the reverse.
+
+**A merge must never diff as "no change".** `CACHED_COMMIT_REF` is the last commit the *site* built
+in any context, deploy previews included, and a PR's preview already contains that PR's changes. With
+only that diff, merging a PR right after its preview canceled the production build — PR #35 sat
+merged but not live on 2026-09-13, with "Canceled build due to no content change" in the deploy
+log. So each `ignore` also diffs `$COMMIT_REF^` → `$COMMIT_REF`, and a build skips only when both are
+empty. After any merge, confirm the production deploy says *Published*, not *Canceled*.
 
 ---
 

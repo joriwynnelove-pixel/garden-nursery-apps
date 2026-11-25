@@ -24,10 +24,29 @@ export function setLoading(container, on) {
 // =============================================
 //  Modal
 // =============================================
+// Has anything in the open form been typed, picked or attached? Set by the
+// listeners below, cleared whenever a modal opens or closes. It is what lets a
+// stray tap on the dimmed area, the ✕ or the phone's Back button ask before
+// throwing a half-filled form away, while Cancel and Save still close at once.
+let _modalDirty = false;
+let _dirtyWired = false;
+
+function wireDirtyTracking() {
+    if (_dirtyWired) return;
+    const body = document.getElementById('modal-body');
+    if (!body) return;
+    const mark = () => { _modalDirty = true; };
+    body.addEventListener('input',  mark);
+    body.addEventListener('change', mark);   // selects, checkboxes, photo pickers
+    _dirtyWired = true;
+}
+
 export function showModal(title, bodyHTML) {
+    wireDirtyTracking();
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-body').innerHTML    = bodyHTML;
     document.getElementById('modal-overlay').classList.add('open');
+    _modalDirty = false;
     // Always start at the top of the form so the first field is visible
     const modal = document.getElementById('modal');
     if (modal) modal.scrollTop = 0;
@@ -36,6 +55,24 @@ export function showModal(title, bodyHTML) {
 export function hideModal() {
     document.getElementById('modal-overlay').classList.remove('open');
     document.getElementById('modal-body').innerHTML = '';
+    _modalDirty = false;
+}
+
+export function isModalOpen() {
+    return document.getElementById('modal-overlay').classList.contains('open');
+}
+
+/**
+ * Close the modal the way an accidental gesture would: ask first if the form
+ * has been touched. Returns true if it closed. Use this for the dimmed
+ * overlay, the ✕ and the Back button; a form's own Cancel and Save buttons
+ * are deliberate and keep calling hideModal().
+ */
+export function requestCloseModal() {
+    if (!isModalOpen()) return true;
+    if (_modalDirty && !confirm('Discard what you have entered?')) return false;
+    hideModal();
+    return true;
 }
 
 // =============================================
@@ -91,6 +128,67 @@ export function showToast(message, type = 'info') {
     toast.textContent = message;
     container.appendChild(toast);
     setTimeout(() => toast.remove(), 3000);
+}
+
+// =============================================
+//  Offline and sync indicator
+//  Call once at startup. Shows a small pill under the header while the device
+//  is offline or while writes are waiting to reach the server, and turns the
+//  two failures nothing else reports into toasts: a queued write the server
+//  later refused (db.js, 'write-failed'), and any error no code caught.
+// =============================================
+export function initSyncIndicator() {
+    if (document.getElementById('sync-pill')) return;
+    const pill = document.createElement('div');
+    pill.id = 'sync-pill';
+    pill.className = 'sync-pill';
+    pill.setAttribute('role', 'status');
+    document.body.appendChild(pill);
+
+    let unsynced = 0;
+    let timer    = null;
+
+    const draw = () => {
+        let text = '';
+        if (!navigator.onLine) {
+            text = unsynced > 0
+                ? `Offline · ${unsynced} change${unsynced !== 1 ? 's' : ''} will send when you're back in range`
+                : 'Offline · showing what this device has saved';
+        } else if (unsynced > 0) {
+            text = `Sending ${unsynced} change${unsynced !== 1 ? 's' : ''}…`;
+        }
+        pill.textContent = text;
+        pill.classList.toggle('visible', !!text);
+        pill.classList.toggle('offline', !navigator.onLine);
+    };
+
+    window.addEventListener('online',  draw);
+    window.addEventListener('offline', draw);
+    window.addEventListener('sync-state', e => {
+        unsynced = e.detail.unsynced;
+        clearTimeout(timer);
+        // An ordinary save is confirmed in well under a second; only say
+        // "Sending…" for one that is taking long enough to wonder about.
+        if (unsynced > 0 && navigator.onLine) timer = setTimeout(draw, 1500);
+        else draw();
+    });
+    window.addEventListener('write-failed', () => {
+        showToast('A change made earlier could not be saved. Please check it and try again.', 'error');
+    });
+
+    let lastErrorToast = 0;
+    window.addEventListener('unhandledrejection', e => {
+        const code = e.reason && e.reason.code ? String(e.reason.code) : '';
+        if (code.startsWith('auth/')) return;          // sign-in popups report their own
+        console.error('Unhandled error:', e.reason);
+        if (Date.now() - lastErrorToast < 5000) return; // one toast, not a stack of them
+        lastErrorToast = Date.now();
+        showToast(navigator.onLine
+            ? 'Something went wrong. Please try that again.'
+            : 'That needs a connection. Try again when you have signal.', 'error');
+    });
+
+    draw();
 }
 
 // =============================================
@@ -200,8 +298,18 @@ export function initPhotoDragSort(gridEl, onOrderChange) {
 //  Renders a text input with auto-hyphen formatting + a calendar button.
 //  Call initDatePickers(container) after the HTML is in the DOM.
 // =============================================
+// On a phone or tablet the system's own date wheel is quicker than typing
+// digits and cannot produce an invalid date, so there the field is a plain
+// <input type="date">. A laptop keeps the typed field with its calendar button.
+// Both give the form the same thing: '' or a YYYY-MM-DD string under the same
+// id and name, so no caller needs to know which it got.
+const TOUCH_FIRST = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+
 export function datePicker(id, name, value = '') {
     const safe = (value || '').replace(/"/g, '&quot;');
+    if (TOUCH_FIRST) {
+        return `<input class="form-input date-native" type="date" id="${id}" name="${name}" value="${safe}">`;
+    }
     return `
         <div class="date-picker-wrap">
             <input class="form-input date-text" type="text"

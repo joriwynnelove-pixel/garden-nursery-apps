@@ -5,9 +5,11 @@
 
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import {
-    getFirestore,
+    getFirestore, initializeFirestore,
+    persistentLocalCache, persistentMultipleTabManager,
     collection, doc,
-    addDoc, setDoc, updateDoc, deleteDoc,
+    setDoc as fsSetDoc, updateDoc as fsUpdateDoc, deleteDoc as fsDeleteDoc,
+    writeBatch,
     getDocs, getDoc,
     query, orderBy, where, limit,
     serverTimestamp
@@ -19,15 +21,184 @@ import {
 import imageCompression from 'https://cdn.jsdelivr.net/npm/browser-image-compression@2/dist/browser-image-compression.mjs';
 
 import { firebaseConfig } from '../firebase-config.js';
+import { isUncounted, uncountedQtyText } from './germination.js';
 
 // ---------- Initialise Firebase ----------
 let app, db, storage;
+
+// =============================================
+//  Offline: a cache on the device, and writes that queue
+// =============================================
+// Added 2026-11. Two things make the app usable with poor or no signal.
+//
+// 1. Firestore keeps its data in IndexedDB on the device (see initFirebase).
+//    A read with no connection is answered from that copy, and a write made
+//    with no connection is stored there and sent when the connection returns,
+//    even if the app has been closed in between.
+//
+// 2. Every write in this file goes through queued(). Firestore's own write
+//    promise does not settle until the SERVER has the write, so out of signal
+//    an awaited save would leave its form on "Saving…" for as long as you stay
+//    out of range. queued() waits a few seconds for the server and then lets
+//    the caller carry on: the write is already safe in the local cache and is
+//    in every read from that moment.
+//
+// The cost of (2): a write the server later REFUSES (the security rules) can no
+// longer fail the form that made it once queued() has let go. That is announced
+// with a 'write-failed' event instead, which ui-utils turns into a toast. When
+// the server is reachable a refusal arrives well inside the wait, so the form
+// still sees it as before.
+//
+// addDoc, setDoc, updateDoc and deleteDoc below shadow Firestore's own, which
+// are imported under fs* names, so the rest of this file reads as it always
+// did and cannot bypass the queue by accident.
+
+const ACK_WAIT_MS         = 5000;  // online: how long to wait for the server
+const ACK_WAIT_OFFLINE_MS = 300;   // browser already says we are offline
+
+let unsynced = 0;                  // writes the server has not confirmed yet
+
+function announceSync() {
+    window.dispatchEvent(new CustomEvent('sync-state', { detail: { unsynced } }));
+}
+
+function queued(serverPromise) {
+    unsynced++;
+    announceSync();
+    let acked = false, released = false;
+    const settled = serverPromise.then(
+        value => { acked = true; unsynced--; announceSync(); return value; },
+        err   => {
+            acked = true; unsynced--; announceSync();
+            if (released) {
+                console.error('A queued write was refused:', err);
+                window.dispatchEvent(new CustomEvent('write-failed', { detail: err }));
+            }
+            throw err;
+        }
+    );
+    return new Promise((resolve, reject) => {
+        settled.then(resolve, err => { if (!released) reject(err); });
+        setTimeout(() => {
+            if (!acked) { released = true; resolve(undefined); }
+        }, navigator.onLine ? ACK_WAIT_MS : ACK_WAIT_OFFLINE_MS);
+    });
+}
+
+// addDoc must hand back the new document's reference straight away, so the id
+// is made on the device (which is all Firestore's addDoc does) and written
+// with setDoc.
+function addDoc(collectionRef, data) {
+    const ref = doc(collectionRef);
+    forget(collectionRef.id);
+    return queued(fsSetDoc(ref, data)).then(() => ref);
+}
+// Each also drops the remembered copy of the collection it writes to (see
+// "Remembered collections" below). ref.parent.id is the collection's name.
+const touched   = ref => { forget(ref.parent.id); return ref; };
+const setDoc    = (ref, ...rest) => queued(fsSetDoc(touched(ref), ...rest));
+const updateDoc = (ref, ...rest) => queued(fsUpdateDoc(touched(ref), ...rest));
+const deleteDoc = (ref, ...rest) => queued(fsDeleteDoc(touched(ref), ...rest));
+
+// Writes that belong together go to the server as one step: all of them
+// happen, or none do. Without this, a connection dropped between two awaits
+// left half a change behind, such as a death recorded with the plant still
+// shown in its area. A batch queues offline exactly as a single write does,
+// and counts as one change on the sync pill.
+//
+//     await commitTogether(b => { b.set(refA, dataA); b.delete(refB); });
+function commitTogether(build) {
+    const batch = writeBatch(db);
+    build({
+        set:    (ref, ...rest) => batch.set(touched(ref), ...rest),
+        update: (ref, ...rest) => batch.update(touched(ref), ...rest),
+        delete: ref            => batch.delete(touched(ref)),
+    });
+    return queued(batch.commit());
+}
+
+// Delete a list of documents together. Put a parent LAST: a list too long for
+// one batch goes in several, and if it stops partway the parent is still
+// there, so the delete can simply be run again.
+const BATCH_MAX = 450;
+async function deleteTogether(refs) {
+    for (let i = 0; i < refs.length; i += BATCH_MAX) {
+        const chunk = refs.slice(i, i + BATCH_MAX);
+        await commitTogether(b => chunk.forEach(r => b.delete(r)));
+    }
+}
+
+// =============================================
+//  Remembered collections
+// =============================================
+// Added 2026-11. Every screen used to download whole collections again each
+// time it drew, so tapping a filter chip on Tasks fetched five collections to
+// re-filter what was already on the phone. A whole-collection read is now
+// kept in memory and handed back until one of these happens:
+//
+//   - this app writes to that collection (the write functions above do it,
+//     so a new write function needs nothing special);
+//   - the app comes back to the foreground, or the connection returns;
+//   - two minutes pass.
+//
+// The last two are for changes made somewhere else: the other app, or another
+// person's phone. Until one of them happens such a change is not seen, which
+// is the price of not asking the server on every tap.
+//
+// Only whole-collection reads are kept. A read of one document, or of one
+// plant's or one batch's records, still asks Firestore each time: those are
+// small, and several of them feed a calculation that is then written back.
+//
+// Callers get copies, so a view can sort or change what it is given.
+const REMEMBER_MS = 2 * 60 * 1000;
+const remembered  = new Map();     // collection name -> { at, list, promise }
+
+function forget(...names) {
+    if (names.length) names.forEach(n => remembered.delete(n));
+    else remembered.clear();
+}
+const copies = list => list.map(item => ({ ...item }));
+function current(name) {
+    const entry = remembered.get(name);
+    return entry && Date.now() - entry.at < REMEMBER_MS ? entry : null;
+}
+/** The whole collection, from memory if it is there, else from fetch(). */
+async function whole(name, fetch) {
+    let entry = current(name);
+    if (!entry) {
+        entry = { at: Date.now(), list: null };
+        // A write that lands while this is in flight removes the entry, so the
+        // answer goes to whoever is already waiting and is not kept.
+        entry.promise = fetch().then(
+            list => { entry.list = list; return list; },
+            err  => { if (remembered.get(name) === entry) remembered.delete(name); throw err; }
+        );
+        remembered.set(name, entry);
+    }
+    return copies(await entry.promise);
+}
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') forget();
+});
+window.addEventListener('online', () => forget());
+
 
 export function initFirebase() {
     if (firebaseConfig.apiKey.startsWith('REPLACE_WITH')) return null;
     try {
         app     = initializeApp(firebaseConfig);
-        db      = getFirestore(app);
+        // Keep the data on the device so the app works without signal. The
+        // tab manager lets two tabs of the app share that one copy. A browser
+        // that refuses IndexedDB (some private windows) falls back to the
+        // in-memory cache the app used before: it works, online only.
+        try {
+            db = initializeFirestore(app, {
+                localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+            });
+        } catch (e) {
+            console.warn('Offline cache unavailable, continuing online-only:', e);
+            db = getFirestore(app);
+        }
         storage = getStorage(app);
         return { app, db, storage };
     } catch (e) {
@@ -47,6 +218,36 @@ export function escHtml(s) {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/**
+ * escHtml, plus http(s) URLs turned into links that open in a new tab.
+ * Added 2026-09-14 for notes and descriptions; Garden's db.js has the same
+ * function. The text between URLs and each URL are escaped separately, so
+ * the <a> is the only markup that can reach the page, and the pattern only
+ * matches http and https — never javascript: or data:.
+ */
+export function linkify(str) {
+    if (!str) return '';
+    str = String(str);
+    const re = /\bhttps?:\/\/[^\s<>"']+/gi;
+    let out = '', last = 0, m;
+    while ((m = re.exec(str))) {
+        let url = m[0];
+        // Trailing punctuation belongs to the sentence, not the URL — except
+        // a ')' that closes a '(' inside it, as Wikipedia URLs have.
+        while (/[.,;:!?)\]]$/.test(url)) {
+            const opens  = (url.match(/\(/g) || []).length;
+            const closes = (url.match(/\)/g) || []).length;
+            if (url.endsWith(')') && opens >= closes) break;
+            url = url.slice(0, -1);
+        }
+        out += escHtml(str.slice(last, m.index))
+             + `<a class="text-link" href="${escHtml(url)}" target="_blank" rel="noopener noreferrer">${escHtml(url)}</a>`;
+        last = m.index + url.length;
+        re.lastIndex = last;
+    }
+    return out + escHtml(str.slice(last));
+}
+
 // =============================================
 //  USER MANAGEMENT  (admin panel)
 // =============================================
@@ -57,7 +258,8 @@ export function escHtml(s) {
  *                    role, status, blocked, lastLoginAt, createdAt }
  * Requires admin read access on the users collection (see firestore.rules).
  */
-export async function getUsers() {
+export function getUsers() { return whole('users', fetchUsers); }
+async function fetchUsers() {
     const snap = await getDocs(collection(db, 'users'));
     return snap.docs.map(d => ({ uid: d.id, ...d.data() }));
 }
@@ -94,11 +296,9 @@ export async function setUserBlocked(uid, blocked) {
  * Used to drive the pending-users badge on the Admin nav tab.
  */
 export async function getPendingUserCount() {
-    const snap = await getDocs(collection(db, 'users'));
-    return snap.docs.filter(d => {
-        const data = d.data();
-        return !data.role && !data.blocked;
-    }).length;
+    // The users list is a handful of documents and the Admin panel wants it
+    // anyway, so this shares the one remembered read with getUsers().
+    return (await getUsers()).filter(u => !u.role && !u.blocked).length;
 }
 
 /** Format a YYYY-MM-DD string as "14 May 26" */
@@ -150,7 +350,8 @@ export function formatBotanicalName(o) {
 //  PROPAGATION LOCATIONS  (nursery_locations)
 // =============================================
 
-export async function getNurseryLocations() {
+export function getNurseryLocations() { return whole('nursery_locations', fetchNurseryLocations); }
+async function fetchNurseryLocations() {
     const q = query(collection(db, 'nursery_locations'), orderBy('name'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -184,7 +385,8 @@ export async function deleteNurseryLocation(id) {
 //  PROPAGATION BATCHES  (nursery_batches)
 // =============================================
 
-export async function getNurseryBatches() {
+export function getNurseryBatches() { return whole('nursery_batches', fetchNurseryBatches); }
+async function fetchNurseryBatches() {
     const q = query(collection(db, 'nursery_batches'), orderBy('startDate', 'desc'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -227,21 +429,22 @@ export async function deleteNurseryBatch(id) {
     const logSnap = await getDocs(
         query(collection(db, 'nursery_logs'), where('batchId', '==', id))
     );
-    for (const d of logSnap.docs) await deleteDoc(d.ref);
-
     const outcomeSnap = await getDocs(
         query(collection(db, 'nursery_outcomes'), where('batchId', '==', id))
     );
-    for (const d of outcomeSnap.docs) await deleteDoc(d.ref);
-
-    return await deleteDoc(doc(db, 'nursery_batches', id));
+    return await deleteTogether([
+        ...logSnap.docs.map(d => d.ref),
+        ...outcomeSnap.docs.map(d => d.ref),
+        doc(db, 'nursery_batches', id),
+    ]);
 }
 
 // =============================================
 //  PROPAGATION LOGS  (nursery_logs)
 // =============================================
 
-export async function getAllNurseryLogs() {
+export function getAllNurseryLogs() { return whole('nursery_logs', fetchAllNurseryLogs); }
+async function fetchAllNurseryLogs() {
     const snap = await getDocs(collection(db, 'nursery_logs'));
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
@@ -320,6 +523,7 @@ export async function deleteNurseryOutcome(id) {
  * Otherwise → "X of Y left" (e.g. "2 of 25 left").
  */
 export function formatBatchQty(batch, opts = {}) {
+    if (isUncounted(batch)) return uncountedQtyText(batch);
     const start = batch?.startQty ?? null;
     const cur   = batch?.currentQty ?? batch?.startQty ?? null;
     if (cur == null && start == null) return '—';
@@ -374,6 +578,9 @@ export async function getDerivedBatchQty(batch) {
 export async function recomputeBatchState(batchId, effectiveDate) {
     const batch = await getNurseryBatch(batchId);
     if (!batch) return null;
+    // A seed batch with no plant count yet has nothing to count down from, and
+    // must not close itself as lost because startQty is empty (germination.js).
+    if (isUncounted(batch)) return batch;
 
     const [logs, outcomes] = await Promise.all([
         getLogsForBatch(batchId),
@@ -415,24 +622,38 @@ export async function getChildBatches(parentBatchId) {
     return results.sort((a, b) => (b.startDate || '').localeCompare(a.startDate || ''));
 }
 
-// When planting out, write a Garden Management plant record (if needed) and instance
-export async function plantOutToGarden(batchData, areaId, areaName, quantity, date, notes) {
-    // Write nursery outcome
-    await addNurseryOutcome({
-        batchId:   batchData.id,
-        date,
-        type:      'planted-out',
-        quantity,
-        areaId,
-        areaName,
-        notes
-    });
+// When planting out, write a Garden Management plant record (if needed) and instance.
+// The outcome, the plant and the instance go to the server as one step, so the
+// Nursery cannot record a planting-out that Garden never received.
+// `gardenPlantId` overrides the batch's link: a plant ID adds to that plant, null
+// creates a new one. Left out, the batch's own link decides.
+export async function plantOutToGarden(batchData, areaId, areaName, quantity, date, notes, { gardenPlantId } = {}) {
+    // A link to a Garden plant that has since been deleted counts as no link.
+    // Otherwise the instance below would point at nothing and never show in
+    // Garden. Checked before anything is written, so a failed read writes nothing.
+    let plantId = gardenPlantId !== undefined ? gardenPlantId : (batchData.plantId || null);
+    if (plantId && !(await gardenPlantExists(plantId))) plantId = null;
 
-    // Resolve or create the Garden Management plant record
-    let plantId = batchData.plantId || null;
-    if (!plantId) {
-        // Batch has no linked Garden plant (e.g. received as gift/purchase) — create one now
-        const plantRef = await addDoc(collection(db, 'plants'), {
+    // No linked Garden plant (a gift or purchase, or the link was dead) — one
+    // is created below. Its id is made here, on the device.
+    const newPlantRef = plantId ? null : doc(collection(db, 'plants'));
+    if (newPlantRef) plantId = newPlantRef.id;
+
+    await commitTogether(b => {
+        // The nursery outcome
+        b.set(doc(collection(db, 'nursery_outcomes')), {
+            batchId:   batchData.id,
+            date,
+            type:      'planted-out',
+            quantity,
+            areaId,
+            areaName,
+            notes,
+            createdAt: serverTimestamp()
+        });
+
+        // The Garden Management plant record, if there was none
+        if (newPlantRef) b.set(newPlantRef, {
             commonName:    batchData.commonName   || batchData.plantName || '',
             genus:         batchData.genus         || '',
             species:       batchData.species        || '',
@@ -450,17 +671,16 @@ export async function plantOutToGarden(batchData, areaId, areaName, quantity, da
             photoOrder:    [],
             createdAt:     serverTimestamp(),
         });
-        plantId = plantRef.id;
-    }
 
-    // Write the instance linking the plant to the area
-    await addDoc(collection(db, 'instances'), {
-        plantId,
-        areaId,
-        quantity,
-        datePlanted: date,
-        notes:       `From nursery batch${notes ? ': ' + notes : ''}`,
-        createdAt:   serverTimestamp()
+        // The instance linking the plant to the area
+        b.set(doc(collection(db, 'instances')), {
+            plantId,
+            areaId,
+            quantity,
+            datePlanted: date,
+            notes:       `From nursery batch${notes ? ': ' + notes : ''}`,
+            createdAt:   serverTimestamp()
+        });
     });
 
     // Return the resolved plantId so the caller can store it back on the batch if it was newly created
@@ -471,15 +691,26 @@ export async function plantOutToGarden(batchData, areaId, areaName, quantity, da
 //  GARDEN MANAGEMENT cross-reference reads
 // =============================================
 
+/** Does this Garden plant still exist? A batch's plantId can outlive the plant,
+ *  because Garden deletes plants without looking at nursery batches. Throws if
+ *  the read fails, so callers can tell "gone" from "couldn't check". */
+export async function gardenPlantExists(plantId) {
+    if (!plantId) return false;
+    const snap = await getDoc(doc(db, 'plants', plantId));
+    return snap.exists();
+}
+
 /** Read the Garden Management plants list for the plant picker */
-export async function getGardenPlants() {
+export function getGardenPlants() { return whole('plants', fetchGardenPlants); }
+async function fetchGardenPlants() {
     const q = query(collection(db, 'plants'), orderBy('genus'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
 /** Read the Garden Management areas list for the "planted out" picker */
-export async function getGardenAreas() {
+export function getGardenAreas() { return whole('areas', fetchGardenAreas); }
+async function fetchGardenAreas() {
     const q = query(collection(db, 'areas'), orderBy('name'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -583,6 +814,16 @@ export const STAGE_ORDER = [
     'pre-sowing', 'propagating', 'rooted', 'potted-up', 'hardening-off', 'ready', 'completed'
 ];
 
+/**
+ * A stage's label for one batch. Seed germinates rather than roots, so a seed
+ * batch at 'rooted' reads "Germinated". Views that total batches of every
+ * method (dashboard pills, stats pipeline) keep STAGE_LABELS.
+ */
+export function stageLabel(stage, method) {
+    if (stage === 'rooted' && method === 'seed') return 'Germinated';
+    return STAGE_LABELS[stage] || stage || '—';
+}
+
 export const LOSS_REASON_LABELS = {
     'damping-off': 'Damping off',
     'rot':         'Rot',
@@ -597,7 +838,8 @@ export const LOSS_REASON_LABELS = {
 //  WISHLIST / IDEAS  (nursery_wishlist)
 // =============================================
 
-export async function getNurseryWishlist() {
+export function getNurseryWishlist() { return whole('nursery_wishlist', fetchNurseryWishlist); }
+async function fetchNurseryWishlist() {
     const snap = await getDocs(collection(db, 'nursery_wishlist'));
     const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     // Sort: by priority (high first), then createdAt desc
@@ -635,7 +877,8 @@ export async function deleteNurseryWishlistItem(id) {
 //  PROPAGATION PLANS  (nursery_plans)
 // =============================================
 
-export async function getNurseryPlans() {
+export function getNurseryPlans() { return whole('nursery_plans', fetchNurseryPlans); }
+async function fetchNurseryPlans() {
     const snap = await getDocs(collection(db, 'nursery_plans'));
     const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     // Sort: active ideas first (not done), then by createdAt desc

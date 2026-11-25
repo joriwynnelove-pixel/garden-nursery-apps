@@ -37,7 +37,7 @@ Environment variables on the Nursery site:
 | `FIREBASE_APP_ID` | ” |
 | `GARDEN_URL` | **Nursery only.** The companion Garden site's address, written into `app-config.js`. The two links back to Garden hide themselves when it is unset — see below. |
 | `GEMINI_API_KEY` | Google AI Studio key for the label-scan and plant-lookup functions. Set and working. |
-| `GEMINI_MODEL` | Optional; defaults to `gemini-flash-latest` |
+| `GEMINI_MODEL` | Optional. The code falls back to `gemini-3.5-flash`; set `gemini-flash-latest` to always track the newest Flash |
 | `GEMINI_MODEL_RESEARCH` | Not set — research runs on full Flash since the 30s timeout increase. Only needed if that is ever lost. |
 | `LOOKUP_BUDGET_MS` | `27000`, just inside Netlify's 30s function timeout. Code default is 8500. |
 
@@ -65,12 +65,12 @@ apps/nursery/
 ├── functions/               ← 2 Netlify serverless functions, both byte-identical
 │   ├── scan-label.js        ←   to Garden's copies
 │   └── lookup-plant.js      ←
-└── js/                      ← 22 ES modules
+└── js/                      ← 25 ES modules
 ```
 
 ---
 
-## JS module map (22 modules)
+## JS module map (25 modules)
 
 ### Core
 
@@ -79,7 +79,7 @@ apps/nursery/
 | `main.js` | Entry point: router, auth state listener, nav. Owns navigation and injects it into `ui-utils`. | `navigate`, `navigateReplace`, `goBack` |
 | `db.js` | Every Firestore + Storage read/write, plus the batch-quantity maths and label constants. ~700 lines. | see [below](#dbjs-exports) |
 | `auth.js` | Auth state, role cache, sign-in helpers. **Byte-identical to Garden's.** | `initAuth`, `getAuthInstance`, `getCurrentUser`, `getCurrentRole`, `isAtLeast`, `loadRole`, `setCurrentUser`, `setRole`, `signInWithGoogle`, `signInWithEmail`, `signInAsGuest`, `signOutUser` |
-| `ui-utils.js` | Modal, toast, carousel, drag-sort, date picker. Navigation is injected via `setNavigateFn` etc. rather than imported. | `setNavigateFn`, `setGoBackFn`, `setNavigateReplaceFn`, `navigate`, `goBack`, `navigateReplace`, `setLoading`, `showModal`, `hideModal`, `initPhotoCarousel`, `showToast`, `initPhotoDragSort`, `datePicker`, **`isValidDateStr`**, `initDatePickers` |
+| `ui-utils.js` | Modal, toast, carousel, drag-sort, date picker. Navigation is injected via `setNavigateFn` etc. rather than imported. | `setNavigateFn`, `setGoBackFn`, `setNavigateReplaceFn`, `navigate`, `goBack`, `navigateReplace`, `setLoading`, `showModal`, `hideModal`, `isModalOpen`, `requestCloseModal` (closes, asking first if the form was touched — for the overlay, the ✕ and Back; Cancel and Save use `hideModal`), `initPhotoCarousel`, `showToast`, `initPhotoDragSort`, `datePicker`, **`isValidDateStr`**, `initDatePickers` |
 | `auth-view.js` | Login / access-denied overlay | `showLoginOverlay`, `hideLoginOverlay`, `showAccessDenied` |
 
 > `isValidDateStr()` exists here but **not** in Garden's `ui-utils.js` — the one known drift between
@@ -101,8 +101,11 @@ so `main.js` has one import site while the implementation lives in focused modul
 | `batch-log-edit.js` | Edit an existing log entry | `showEditLogForm` |
 | `batch-outcomes.js` | Record and render outcomes: planted-out / given-away / lost / retired | `loadAndRenderOutcomes`, `showOutcomeForm` |
 | `batch-photos.js` | Batch photo grid and lightbox | `openNurseryPhotoLightbox`, `loadAndRenderBatchPhotos` |
-| `batch-pretreatment.js` | Pre-sowing treatment UI: the batch-form section, the detail card, and its Checked / Start next step / Sow now actions | `pretreatmentFormHTML`, `initPretreatmentForm`, `readPretreatmentForm`, `pretreatmentCardHTML`, `pretreatmentHistoryHTML`, `initPretreatmentActions` |
-| `pretreatment.js` | Pre-sowing treatment logic: step types, date arithmetic, status, and the partial updates for check / next step / sow. **No imports**, so Node can load it to test the dates. | `PRETREATMENT_TYPES`, `pretreatmentStatus`, `pretreatmentNeedsAttention`, `initialStage`, `checkUpdates`, `nextStepUpdates`, `sowUpdates` |
+| `batch-pretreatment.js` | Pre-sowing treatment UI: the batch-form section, the detail card, and its Mark done / Start / Finish / ✎ / Checked / Sow now actions | `pretreatmentFormHTML`, `initPretreatmentForm`, `readPretreatmentForm`, `pretreatmentCardHTML`, `pretreatmentHistoryHTML`, `initPretreatmentActions` |
+| `pretreatment.js` | Pre-sowing treatment logic: step types, date arithmetic, status, and the partial updates for check / next step / sow. **No imports**, so Node can load it to test the dates. | `PRETREATMENT_TYPES`, `pretreatmentStatus`, `pretreatmentNeedsAttention`, `stepDateBounds`, `initialStage`, `checkUpdates`, `advanceStepUpdates`, `finishStepUpdates`, `setStepDatesUpdates`, `undoStepUpdates`, `sowUpdates` |
+| `batch-germination.js` | The Record germination / Update seedling count dialog | `showGerminationForm` |
+| `germination.js` | Seed counts and germination: whether a seed batch has a plant count yet, seed counts, germination rate, and the partial updates for counting and sowing. **No imports**, so Node can load it. | `isUncounted`, `seedsOf`, `germinationRate`, `germinationText`, `uncountedQtyText`, `germinationUpdates`, `sownSeedUpdates` |
+| `plant-match.js` | Which Garden plants are the same plant as a batch, for plant-out: every botanical part equal, ignoring case, quote marks, the hybrid × and authority; with no genus, name against common name. **No imports**, so Node can load it. | `matchGardenPlants` |
 
 ### Other views
 
@@ -130,13 +133,14 @@ so `main.js` has one import site while the implementation lives in focused modul
   `deleteNurseryOutcome`
 - **Quantity maths:** `formatBatchQty`, `derivedBatchQty`, `getDerivedBatchQty`,
   `recomputeBatchState`
-- **Cross-app:** `plantOutToGarden`, `getGardenPlants`, `getGardenAreas`
+- **Cross-app:** `plantOutToGarden` (optional `{ gardenPlantId }`), `getGardenPlants`, `getGardenAreas`, `gardenPlantExists`
 - **Photos:** `uploadNurseryPhoto`, `deleteNurseryPhoto`
 - **Wishlist:** `getNurseryWishlist`, `addNurseryWishlistItem`, `updateNurseryWishlistItem`,
   `deleteNurseryWishlistItem`
 - **Plans:** `getNurseryPlans`, `addNurseryPlan`, `updateNurseryPlan`, `deleteNurseryPlan`
 - **Users:** `getUsers`, `updateUserRole`, `setUserBlocked`, `getPendingUserCount`
-- **Helpers:** `initFirebase`, `escHtml`, `fmtDate`, `todayStr`, `hybridTypeOf`,
+- **Helpers:** `initFirebase`, `escHtml`, `linkify` (escHtml plus clickable http/https URLs, for
+  free-text fields; same function as Garden's), `fmtDate`, `todayStr`, `hybridTypeOf`,
   `formatBotanicalName`, `exportNurseryData`
 - **Constants:** `METHOD_LABELS`, `STAGE_LABELS`, `STAGE_ORDER`, `LOSS_REASON_LABELS`,
   `PLAN_METHOD_LABELS`, `PLAN_TIMING_OPTIONS`, `PLAN_STATUS_LABELS`
@@ -164,6 +168,22 @@ adjustment — it also handles completion:
 - back **above 0** while completed → reopened to `stage: 'ready'`, `completedAt`/`outcome` cleared
 
 Stage is otherwise left alone.
+
+**Seed batches start uncounted.** Seed is often too fine to count, so a seed batch has `startQty:
+null` until germination is recorded, and `seedCount` (seeds sown) is optional. `isUncounted()` in
+`germination.js` is true for such a batch, and for any batch at `pre-sowing`. While it is:
+
+- `formatBatchQty()` shows the seeds instead (*40 seeds sown · not counted*)
+- `recomputeBatchState()` returns without touching the batch — an empty `startQty` would otherwise
+  complete it as lost, and batch-detail's self-heal would re-render forever
+- outcomes are refused, and log entries hide *Plants removed*
+
+**Record germination** (`batch-germination.js`) sets `startQty` to the tray count **plus** everything
+already lost, thinned or moved on, so `currentQty` equals the count and the germination rate
+(`startQty / seedCount`) stays honest. Recording it again as more come up replaces the count and
+resets `qtyAdjustment`. A count of 0 leaves the stage alone and lets the recompute close the batch as
+lost. For seed, the `rooted` stage reads **Germinated**: use `stageLabel(stage, method)` wherever one
+batch's stage is shown, and `STAGE_LABELS` only where batches of every method are totalled.
 
 ### Stages, methods, outcomes
 
@@ -204,11 +224,28 @@ it out otherwise, so every other batch keeps five steps.
 
 ### Plant out → Garden
 
-`plantOutToGarden()` writes a `nursery_outcomes` row, then reaches into **Garden's** collections: it
+`plantOutToGarden()` writes a `nursery_outcomes` row and, in the same batch, reaches into **Garden's** collections: it
 creates a `plants` document if the batch has no `plantId` yet (e.g. the batch came from a gift or
-purchase), and always writes an `instances` row linking plant to area. It returns the resolved
-`plantId` so the caller can store it back on the batch. Editing this function changes Garden's data
-— treat it as cross-app surface area.
+purchase) **or its `plantId` points at a plant Garden has since deleted**, and always writes an
+`instances` row linking plant to area. It returns the resolved `plantId`, and the caller stores it
+back on the batch whenever it differs. Editing this function changes Garden's data — treat it as
+cross-app surface area.
+
+**Plant-out adds to an existing Garden plant where it can.** A Garden plant is the species or
+cultivar and an `instances` row is that plant in an area, so a second planting of the same plant is
+a new instance, not a new plant. The outcome form (`wireGardenPlantChoice()` in `batch-outcomes.js`)
+reads Garden's plants fresh. A live link just says which plant it adds to; otherwise
+`matchGardenPlants()` offers any same plants, the first selected, beside *Create a new Garden
+plant*. The choice reaches `plantOutToGarden()` as `{ gardenPlantId }`: an ID adds to that plant,
+`null` creates one, and leaving it out lets the batch's link decide.
+
+**A batch holds its own copy of the plant; `plantId` is only a pointer.** Garden deletes plants
+without looking at nursery batches, so a link can go dead at any time. Linking in the batch form
+copies the Garden plant's name and details into the batch's own fields (Garden's `notes`,
+`careReminders`, `height`, `width` become the batch's `description`, `careNotes`, `ultimateHeight`,
+`ultimateWidth`), and saving always writes those fields rather than re-reading the Garden plant.
+`gardenPlantExists()` is how the detail view, the form and plant-out spot a dead link; each treats a
+failed read as "couldn't check", never as "gone".
 
 The reverse leg is `transferToNursery()` in **Garden's** `db.js`, which writes a `nursery_batches`
 document straight into this app's collections. Neither direction is a network call between the two
@@ -221,7 +258,8 @@ Two places link out to the companion Garden **site** (as opposed to writing to i
 read `GARDEN_URL` from the generated `app-config.js`:
 
 - `admin-view.js` — the "Open Garden Management" button in the Admin panel
-- `batch-detail.js` — the "🌿 View in garden" link on a batch with a `plantId`
+- `batch-detail.js` — the "🌿 View in garden" link on a batch with a `plantId`, replaced by a
+  "Garden record removed" note when that plant no longer exists
 
 Both render only when `GARDEN_URL` is a non-empty string, so a Nursery-only installation shows no
 links to a Garden site that does not exist. Never hard-code the URL back in: it is the one piece of

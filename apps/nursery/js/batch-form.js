@@ -3,7 +3,7 @@
 // =============================================================
 
 import {
-    getNurseryBatches, getGardenPlants,
+    getNurseryBatches, getGardenPlants, gardenPlantExists,
     addNurseryBatch, updateNurseryBatch, escHtml, todayStr,
     formatBotanicalName, hybridTypeOf,
     getDerivedBatchQty, recomputeBatchState
@@ -12,6 +12,7 @@ import { showModal, hideModal, showToast, initDatePickers, datePicker, isValidDa
 import { scanPanelHTML, initLabelScan } from './label-scan.js';
 import { lookupPanelHTML, initPlantLookup } from './plant-lookup.js';
 import { pretreatmentFormHTML, initPretreatmentForm, readPretreatmentForm } from './batch-pretreatment.js';
+import { isUncounted, seedsOf } from './germination.js';
 
 // Cache garden plants for the session (fetched once per form open)
 let _gardenPlantsCache = null;
@@ -86,6 +87,14 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
     const src = existing?.source || {};
     // Effective hybrid type for the selector (legacy boolean hybrid → interspecific)
     const existingHt = existing?.hybridType || (existing?.hybrid ? 'interspecific' : '');
+    // Seed has no plant count until seedlings are counted (germination.js), so a
+    // new seed batch asks for seeds sown instead of a starting quantity.
+    const countedAtOpen = !isUncounted({
+        method:   existing?.method || 'seed',
+        stage:    existing?.stage,
+        startQty: isEdit ? existing?.startQty : null,
+    });
+    const seedAtOpen = (existing?.method || 'seed') === 'seed';
 
     showModal(isEdit ? 'Edit Batch' : 'New Propagation Batch', `
         <form id="batch-form" novalidate>
@@ -223,7 +232,7 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
                     Linking to the library lets the Stats and Plants views track this species over time.
                 </p>
             </div>
-            <div id="botanical-group" style="display:${selectedPlantId ? 'none' : 'block'};">
+            <div id="botanical-group">
                 <div class="form-row-two">
                     <div class="form-group">
                         <label class="form-label" for="genus-input">Genus (optional)</label>
@@ -271,9 +280,8 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
                 </div>
 
                 <!-- Follows the order of work: name the plant, look it up, fill in the
-                     rest. Deliberately INSIDE botanical-group, so it disappears when a
-                     batch is linked to an existing plant — the lookup reads the botanical
-                     inputs, and those are empty in that case. -->
+                     rest. The lookup reads these botanical inputs, which linking a
+                     Garden plant fills in as well. -->
                 ${lookupPanelHTML()}
 
                 <div class="form-group">
@@ -326,14 +334,23 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
                     <label class="form-label" for="start-date">Start date <span class="required">*</span></label>
                     ${datePicker('start-date', 'startDate', existing?.startDate || todayStr())}
                 </div>
-                <div class="form-group">
-                    <label class="form-label" for="start-qty">Starting quantity <span class="required">*</span></label>
+                <div class="form-group" id="start-qty-group" style="display:${countedAtOpen ? 'block' : 'none'};">
+                    <label class="form-label" for="start-qty" id="start-qty-label">${seedAtOpen ? 'Seedlings' : 'Starting quantity'} <span class="required">*</span></label>
                     <input class="form-input" type="number" id="start-qty" name="startQty"
                            min="1" value="${existing?.startQty ?? 1}" required>
                 </div>
+                <div class="form-group" id="seed-count-group" style="display:${seedAtOpen ? 'block' : 'none'};">
+                    <label class="form-label" for="seed-count">Seeds sown (optional)</label>
+                    <input class="form-input" type="number" id="seed-count" name="seedCount"
+                           min="1" value="${seedsOf(existing) ?? ''}" placeholder="Not counted">
+                </div>
             </div>
+            <p class="form-hint" id="seed-count-hint" style="display:${seedAtOpen && !countedAtOpen ? 'block' : 'none'};margin:-6px 0 14px;">
+                Fill in seeds sown if you counted them; leave it blank for fine seed that's scattered.
+                You'll count seedlings with <strong>Record germination</strong> when they come up.
+            </p>
             ${isEdit ? `
-            <div class="form-group">
+            <div class="form-group" id="current-qty-group" style="display:${countedAtOpen ? 'block' : 'none'};">
                 <label class="form-label" for="current-qty">Number remaining</label>
                 <input class="form-input" type="number" id="current-qty" name="currentQty"
                        min="0" max="${existing?.startQty ?? 1}"
@@ -447,8 +464,16 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
     const chipLabel   = document.getElementById('linked-chip-label');
     const unlinkBtn   = document.getElementById('unlink-plant-btn');
     const libraryHint = document.getElementById('library-hint');
-    const botanicalGrp= document.getElementById('botanical-group');
+    const LIBRARY_HINT = libraryHint?.textContent.trim() || '';
 
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+    const fillIfEmpty = (id, v) => {
+        const el = document.getElementById(id);
+        if (el && v && !el.value.trim()) el.value = v;
+    };
+
+    // Linking copies the Garden plant's details into the batch's own fields, so
+    // the batch still has them if that plant is later edited or deleted.
     function setSelectedPlant(plant) {
         selectedPlantId   = plant.id;
         // Use botanical name (correct × placement) as the display/save name for linked plants
@@ -458,39 +483,42 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         chipLabel.textContent = selectedPlantName;
         linkedChip.style.display  = 'flex';
         libraryHint.style.display = 'none';
-        botanicalGrp.style.display= 'none';
         dropdown.style.display    = 'none';
-        // Reflect the linked plant's hybrid type in the selector
+
+        setVal('genus-input',       plant.genus);
+        setVal('species-input',     plant.species);
+        setVal('subspecies-input',  plant.subspecies);
+        setVal('variety-input',     plant.variety);
+        setVal('cultivar-input',    plant.cultivar);
+        setVal('authority-input',   plant.authority);
+        setVal('common-name-input', plant.commonName);
         const htSel = document.getElementById('hybrid-type-select');
         if (htSel) htSel.value = hybridTypeOf(plant) || '';
 
-        // Auto-fill description, care, height & spread from the garden plant record (only if not already typed)
-        const descEl   = document.getElementById('description-input');
-        const careEl   = document.getElementById('care-input');
-        const heightEl = document.getElementById('height-input');
-        const widthEl  = document.getElementById('width-input');
-        if (descEl   && !descEl.value.trim())   descEl.value   = plant.description || '';
-        if (careEl   && !careEl.value.trim())   careEl.value   = plant.careNotes || plant.care || '';
-        if (heightEl && !heightEl.value.trim()) heightEl.value = plant.ultimateHeight || '';
-        if (widthEl  && !widthEl.value.trim())  widthEl.value  = plant.ultimateWidth  || '';
+        // Description, care, height & spread — Garden calls these notes,
+        // careReminders, height and width. Only fills what hasn't been typed.
+        fillIfEmpty('description-input', plant.notes);
+        fillIfEmpty('care-input',        plant.careReminders);
+        fillIfEmpty('height-input',      plant.height);
+        fillIfEmpty('width-input',       plant.width);
+    }
+
+    // Unlinking drops only the pointer to the Garden plant. The name and the
+    // details stay, because the batch holds its own copy of them.
+    function unlinkPlant(hint = LIBRARY_HINT) {
+        selectedPlantId = null;
+        linkedChip.style.display  = 'none';
+        libraryHint.textContent   = hint;
+        libraryHint.style.display = 'block';
     }
 
     unlinkBtn?.addEventListener('click', () => {
-        selectedPlantId = null;
-        linkedChip.style.display  = 'none';
-        libraryHint.style.display = 'block';
-        botanicalGrp.style.display= 'block';
-        plantInput.value = '';
+        unlinkPlant();
         plantInput.focus();
     });
 
     plantInput?.addEventListener('input', () => {
-        if (selectedPlantId) {
-            selectedPlantId = null;
-            linkedChip.style.display  = 'none';
-            libraryHint.style.display = 'block';
-            botanicalGrp.style.display= 'block';
-        }
+        if (selectedPlantId) unlinkPlant();
         const q = plantInput.value.trim().toLowerCase();
         if (gardenPlants.length === 0) { dropdown.style.display = 'none'; return; }
 
@@ -581,11 +609,7 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
     // the batch unlinked from the garden library (we copy the stored values),
     // filling the visible botanical inputs so they save with the new batch.
     function fillFromNurseryBatch(b) {
-        selectedPlantId = null;
-        if (linkedChip)   linkedChip.style.display   = 'none';
-        if (libraryHint)  libraryHint.style.display  = 'block';
-        if (botanicalGrp) botanicalGrp.style.display = 'block';
-        const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+        unlinkPlant();
         setVal('plant-input',       b.plantName || b.botanicalName || '');
         setVal('genus-input',       b.genus);
         setVal('species-input',     b.species);
@@ -597,10 +621,6 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         const htSel = document.getElementById('hybrid-type-select');
         if (htSel) htSel.value = hybridTypeOf(b) || '';
         // Description / care / size — fill only if the user hasn't typed something.
-        const fillIfEmpty = (id, v) => {
-            const el = document.getElementById(id);
-            if (el && v && !el.value.trim()) el.value = v;
-        };
         fillIfEmpty('description-input', b.description);
         fillIfEmpty('care-input',        b.careNotes);
         fillIfEmpty('height-input',      b.ultimateHeight);
@@ -656,6 +676,18 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         });
     }
 
+    // ---- Link to a Garden plant that has since been deleted ----
+    // Checked directly rather than against the cached plant list, which can be
+    // older than the deletion. Saving drops the dead link; a failed read leaves it.
+    if (selectedPlantId) {
+        const linkedId = selectedPlantId;
+        gardenPlantExists(linkedId).then(exists => {
+            if (!exists && selectedPlantId === linkedId) {
+                unlinkPlant('The Garden plant this batch was linked to no longer exists. Saving removes the link — the name and details here stay with the batch.');
+            }
+        }).catch(() => {});
+    }
+
     // ---- Method / seed year / source dynamic show/hide ----
     const methodSelect      = document.getElementById('method-select');
     const sourceTypeEl      = document.getElementById('source-type');
@@ -670,6 +702,16 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         seedYearGrp.style.display      = (methodSelect?.value === 'seed') ? 'block' : 'none';
         const ptGrp = document.getElementById('pretreatment-group');
         if (ptGrp) ptGrp.style.display = (methodSelect?.value === 'seed') ? 'block' : 'none';
+        // Quantity: seed counts seeds now and seedlings later; every other method has a count from the start.
+        const isSeedNow  = methodSelect?.value === 'seed';
+        const countedNow = !isSeedNow || countedAtOpen;
+        document.getElementById('seed-count-group').style.display = isSeedNow ? 'block' : 'none';
+        document.getElementById('seed-count-hint').style.display  = isSeedNow && !countedNow ? 'block' : 'none';
+        document.getElementById('start-qty-group').style.display  = countedNow ? 'block' : 'none';
+        const curQtyGrp = document.getElementById('current-qty-group');
+        if (curQtyGrp) curQtyGrp.style.display = countedNow ? 'block' : 'none';
+        const startQtyLabel = document.getElementById('start-qty-label');
+        if (startQtyLabel) startQtyLabel.firstChild.textContent = isSeedNow ? 'Seedlings ' : 'Starting quantity ';
         if (startingStageGrp) startingStageGrp.style.display = isAcquired ? 'block' : 'none';
         if (purposeGrp)       purposeGrp.style.display       = isAcquired ? 'block' : 'none';
         // When switching to acquired on a new batch, apply sensible defaults
@@ -704,12 +746,9 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
     document.getElementById('batch-form')?.addEventListener('submit', async e => {
         e.preventDefault();
 
-        // Resolve the linked garden plant and hybrid type up front.
-        const linkedPlant = selectedPlantId ? gardenPlants.find(p => p.id === selectedPlantId) : null;
-        const hybridType  = linkedPlant
-            ? (hybridTypeOf(linkedPlant) || null)
-            : (document.getElementById('hybrid-type-select')?.value || null);
-        const hybrid = !!hybridType;
+        // The batch always saves its own fields — linking a Garden plant filled them in.
+        const hybridType = document.getElementById('hybrid-type-select')?.value || null;
+        const hybrid     = !!hybridType;
 
         // If the name field is blank, build it from the botanical inputs (correct × placement)
         let plantName = plantInput?.value.trim();
@@ -742,7 +781,7 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         // derived figure has not loaded yet.
         let currentQty    = isEdit ? (existing.currentQty ?? startQty) : startQty;
         let qtyAdjustment = isEdit ? (existing.qtyAdjustment || 0) : 0;
-        if (isEdit) {
+        if (isEdit && document.getElementById('current-qty-group')?.style.display !== 'none') {
             const typedQty = parseInt(document.getElementById('current-qty')?.value);
             if (Number.isFinite(typedQty)) {
                 if (typedQty < 0 || typedQty > startQty) {
@@ -759,14 +798,15 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         const startingStage = document.getElementById('starting-stage')?.value       || null;
         const srcStockId    = document.getElementById('src-stock-id')?.value         || null;
 
-        // Build botanical components — from linked plant or from individual inputs
-        const genus      = linkedPlant?.genus      || document.getElementById('genus-input')?.value.trim()      || '';
-        const species    = linkedPlant?.species    || document.getElementById('species-input')?.value.trim()    || '';
-        const subspecies = linkedPlant?.subspecies || document.getElementById('subspecies-input')?.value.trim() || '';
-        const variety    = linkedPlant?.variety    || document.getElementById('variety-input')?.value.trim()    || '';
-        const cultivar   = linkedPlant?.cultivar   || document.getElementById('cultivar-input')?.value.trim()  || '';
-        const authority  = linkedPlant?.authority  || document.getElementById('authority-input')?.value.trim() || '';
-        const commonName = linkedPlant?.commonName || document.getElementById('common-name-input')?.value.trim() || '';
+        // Build botanical components from the inputs
+        const inputVal   = id => document.getElementById(id)?.value.trim() || '';
+        const genus      = inputVal('genus-input');
+        const species    = inputVal('species-input');
+        const subspecies = inputVal('subspecies-input');
+        const variety    = inputVal('variety-input');
+        const cultivar   = inputVal('cultivar-input');
+        const authority  = inputVal('authority-input');
+        const commonName = inputVal('common-name-input');
 
         // Build full botanical name string (correct × placement)
         const botanicalName = formatBotanicalName({ genus, species, subspecies, variety, cultivar, authority, hybridType });
@@ -781,6 +821,16 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
         } else if (stage === 'pre-sowing' && (!pt.pretreatment || pt.sownDate)) {
             stage = 'propagating';
         }
+
+        // Seed that isn't sown, or is sown but not yet counted, has no plant count at all.
+        const isSeed       = methodSelect?.value === 'seed';
+        const seedCountRaw = isSeed ? (document.getElementById('seed-count')?.value.trim() || '') : '';
+        const seedCount    = seedCountRaw ? Number(seedCountRaw) : null;
+        if (seedCountRaw && !(Number.isInteger(seedCount) && seedCount > 0)) {
+            showToast('Seeds sown must be a whole number, or blank', 'error');
+            return;
+        }
+        const uncounted = isUncounted({ method: methodSelect?.value, stage, startQty: !isSeed || countedAtOpen ? startQty : null });
 
         const data = {
             plantId:      selectedPlantId || null,
@@ -817,9 +867,10 @@ async function showBatchForm(existing, locations, onSaved, prefill = null) {
                 parentBatchId:  srcType === 'nursery-stock' ? srcStockId : null,
             },
             startDate,
-            startQty,
-            currentQty,
-            qtyAdjustment,
+            startQty:      uncounted ? null : startQty,
+            currentQty:    uncounted ? null : currentQty,
+            qtyAdjustment: uncounted ? 0    : qtyAdjustment,
+            seedCount:     isSeed ? seedCount : null,
             medium:     document.getElementById('medium-input')?.value.trim() || '',
             locationId: document.getElementById('location-select')?.value || null,
             notes:      document.getElementById('notes-input')?.value.trim() || '',

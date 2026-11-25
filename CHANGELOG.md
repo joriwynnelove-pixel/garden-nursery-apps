@@ -23,6 +23,204 @@ Every entry below therefore carries an **Action required** line. `none` means sy
 
 ---
 
+## 2026-11-10 — quicker to start
+
+**Action required: none**
+
+- **Both apps start with less to download.** Screens opened less often are fetched the first time
+  they are needed. Garden's launch went from 19 of its own files (568 KB) to 15 (375 KB), and no
+  longer loads the blog editor; Nursery's from 27 files (410 KB) to 24 (338 KB). A few seconds after
+  launch the rest are fetched in the background, so every screen still opens with no signal later.
+- **Fixed: a task repeating monthly on the 31st skipped February** (31 January was followed by
+  31 March). Months shorter than the chosen day now use their last day.
+- **Fixed: repeat dates could land on the wrong day east of UTC+12**, such as New Zealand in summer.
+- **`CLAUDE.md` is no longer served by either site.** It is a note for whoever works on the code.
+- **For maintainers:** a `tests/` folder, run with `node --test "tests/*.test.mjs"`, and no npm.
+  Garden's pure helpers moved from `db.js` to a new `garden-logic.js` so Node can load them;
+  `db.js` re-exports them, so nothing that imports them changed.
+
+## 2026-11-10 — Tasks screen
+
+**Action required: none**
+
+- **Tasks opens with the tasks showing.** The Overdue section is open, and when there are 15 tasks or
+  fewer every section is. It used to open with every section shut. Once you open or close a section
+  yourself, the screen remembers that for the rest of the visit, separately for By Area and By
+  Status.
+- **A section you leave open stays open** after you change a task's status in By Status. Before, the
+  whole list closed up again.
+- **A round tick at the start of each task marks it done in one tap**, without opening the row, on
+  Tasks, on Overview and on each area's task list. Tap
+  it again to put the task back to To-Do. It does exactly what the Completed and To-Do buttons do,
+  so a task in several areas still asks which areas, and a recurring task still schedules its next
+  date.
+- **The "10 active tasks across all areas" banner is gone**; the same number is on the Tasks tab.
+  The four filter chips now sit on one row.
+- **Add Task: a find box over the area list**, which is also taller. Type part of a name to narrow
+  the 35 areas; areas already ticked stay in view. Long plant lists in the same form get one too.
+
+## 2026-11-10 — easier to tap
+
+**Action required: none**
+
+- **The controls used most are now big enough for a finger.** In Garden: the To-Do / In Progress /
+  Completed pills on a task (they were 26 px high, with Delete just beneath), Edit and Delete on a
+  task, the irrigation Log, Done and Skip buttons, the filter chips, By Area / By Status, and the
+  area chips on Overview. In Nursery: the stage pills, the All / Active / Completed tabs, the sort
+  button and the Planted out / Given away / Lost choice. In both: Back, the role picker in Admin,
+  and every small button. Each is at least 44 px high.
+- **Small ✕ buttons and status pills look the same but respond over a wider area**: the search
+  clear, photo delete, wishlist delete, and the Idea / Planned / Done pill on a plan.
+- **Text you type into is 16 px everywhere.** It is easier to read, and on an iPhone it stops the
+  page zooming in each time a field is tapped.
+- **On a phone or tablet, date fields open the system's own date picker.** A laptop keeps the typed
+  field with its calendar button.
+- **Garden shows dates one way.** Plant cards, plant details and the plant rows in an area now read
+  *4 May 22*, as task rows already did, instead of *2022-05-04*.
+- **The labels under the bottom tabs are slightly larger.**
+
+## 2026-11-10 — Plants list
+
+**Action required: none**
+
+- **The Plants list in Garden opens with the first 60 plants and adds more as you scroll**, instead
+  of drawing every plant at once. Searching is quicker for the same reason.
+- **An A–Z strip down the right-hand edge jumps to a letter.** Tap a letter, or slide a finger down
+  the strip. It appears when the list is long enough to need it.
+- **Three filters under the search box:** *Not placed*, *No photo*, and a picker that shows one
+  area. They combine with each other and with the search, and the count reads *25 of 1068 plants*
+  while any of them is narrowing the list.
+- **Coming back from a plant returns to the same place**, with the same search and filters. Tapping
+  the Plants tab starts afresh.
+- **The genus badge on a plant card is easier to hit.** It looks the same; the area that responds to
+  a finger is larger.
+
+## 2026-11-10
+
+**Action required: none**
+
+- **Saves that change several records now happen completely or not at all.** Recording a plant
+  death, transferring a plant to the nursery and planting a batch out each used to make two or
+  three separate changes, and a connection dropped between them left half behind: a death recorded
+  with the plant still shown in its area, or a planting-out the garden never received. Each is now
+  a single step.
+- **Deleting a plant, area, task, irrigation zone or batch removes it and everything under it
+  together**, and is quicker. Before, a delete that stopped partway left the parent with some of
+  its records gone.
+- **Screens stop downloading the same lists over and over.** Each list (plants, areas, tasks,
+  batches and so on) is kept in memory after its first download, so tapping a filter or the
+  By Area / By Status switch on Tasks redraws at once instead of fetching five lists again.
+- **A change made somewhere else can take up to two minutes to appear**, where before it appeared on
+  the next tap. "Somewhere else" means the other app or another person's device. Changes made in
+  the app you are using still show at once, and returning to the app from another tab or app
+  fetches fresh data.
+- **The Admin panel's record counts and the "has nursery batches" check** ask the server for the
+  number alone instead of downloading every record.
+- **Deleting a plant no longer waits for its photo files to be removed.** The records go first; the
+  files follow in the background. If the device is offline at that moment the files stay behind in
+  Storage, unused.
+
+## 2026-11-09 — works offline
+
+**Action required: none.** Each device builds its offline copy the first time it opens the app
+with a connection after this update.
+
+- **Both apps now work with poor or no signal.** What a device has already loaded is kept on it, so
+  lists and records open without a connection. Changes made without signal are saved on the device
+  and sent when it is back in range, even if the app was closed in between. A pill under the
+  header says when you are offline and how many changes are waiting.
+- **What offline does not cover:** anything that device has never loaded shows as empty rather than
+  as an error; photos cannot be uploaded; label scanning and plant lookup need a connection; and a
+  device that has never opened the app online cannot open it offline.
+- **Fixed: "Access Pending" shown when there was simply no signal.** The app now says it can't
+  connect and offers *Try again*.
+- **Fixed: a task note that failed to save said nothing.** It now reports the failure, as does any
+  other error that nothing else caught.
+
+## 2026-11-09
+
+**Action required: none**
+
+- **The phone's Back button now goes back one screen** in both apps, instead of leaving the app.
+  The same goes for the browser's Back and Forward buttons on a laptop. With a form open, Back
+  closes the form. On a top-level screen, Back leaves as before.
+- **A half-filled form asks before it is thrown away.** Tapping the dimmed area above a form, the ✕,
+  or Back used to discard whatever had been typed. Each now asks first if anything was entered.
+  *Cancel* and *Save* behave as before.
+- **Save and Cancel stay at the bottom of the screen** on every form, so a long form no longer has
+  to be scrolled to its end to save.
+- **A tap visibly registers.** The screen dims and a bar runs under the header while the next
+  screen loads. A screen that fails to load now says so and offers *Retry*.
+- **Garden opens on Tasks**, as intended since April; it had been opening on Overview. The count on
+  the Tasks tab is right from launch.
+- **Fixed:** two quick taps on different tabs could leave the wrong screen showing; AI lookup notes
+  written in the evening were stamped with the next day's date; and two places showed text without
+  escaping it.
+
+## 2026-09-14
+
+**Action required: none**
+
+- **Fixed: Area print view shows plant and area text safely.** *Print → Summary* and *Detailed* on an
+  area put names, notes, heights and the area description into the printed page as raw HTML, so a
+  `<` in a note could break the layout or add markup. Every value is now escaped, as the rest of the
+  app already does. Printouts look the same.
+
+- **Web addresses are now clickable in both apps.** A link starting `http://` or `https://` opens in
+  a new tab, and long addresses wrap instead of running off the screen.
+  - **Garden:** task descriptions and completion notes, a plant's notes and care reminders, the notes
+    on a planting, an area's description on its detail page, and Compost Bin notes. The Areas list,
+    Walk-round rows and printed views still show plain text.
+  - **Nursery:** a batch's initial notes, *About this plant* and care notes, log entry observations,
+    outcome notes, pre-sowing treatment step notes, plan notes, and the descriptions of nursery
+    locations and wishlist items in Admin.
+
+## 2026-09-13
+
+**Action required: none** — but if a change you merged never reached your live site, trigger a
+deploy of `main` for that site in Netlify once.
+
+- **Seed counts and germination.** A seed batch no longer needs a starting quantity. *Seeds sown*
+  is optional — fill it in if you counted them, leave it blank for fine seed that's scattered — and
+  the batch shows *Sown · not counted* until **Record germination** counts the seedlings. That moves
+  it on to a stage that reads **Germinated** for seed, and shows a germination rate when seeds were
+  counted, e.g. *12 of 40 seeds (30%)*. Record it again as more come up; losses and thinning still
+  go in log entries. Entering 0 closes a sowing where nothing came up.
+
+- **Sow now asks how many seeds were sown** on a pre-sowing batch. A pre-sowing batch created before
+  this release, with its seed count typed into *Starting quantity*, carries that number over.
+
+- Seed batches that already have a count are unchanged.
+
+- **Fixed: production builds canceled after a deploy preview.** Each site's `ignore` command
+  compared the commit being built with the last commit that site built in any context, deploy
+  previews included. A pull request's preview already contains its changes, so the merge commit
+  looked unchanged and Netlify canceled the production build ("Canceled build due to no content
+  change"). The command now also compares the commit with its first parent, and a build is skipped
+  only when both comparisons are empty.
+
+- **Fixed: a nursery batch linked to a Garden plant now keeps that plant's details.** Picking a
+  Garden plant in the batch form copied its name but not its description, care notes, height or
+  spread, because it read them under the wrong field names. Linking now copies all of them, and the
+  name fields stay visible so you can see what the batch holds.
+
+- **Fixed: Unlink no longer wipes the plant name.** It removes only the link; the batch keeps its
+  name and details.
+
+- **Fixed: links to deleted Garden plants.** A batch whose Garden plant has been deleted shows
+  "Garden record removed" instead of a broken *View in garden* link, and editing it offers to drop
+  the link. Planting such a batch out used to create a Garden planting that pointed at the deleted
+  plant and never appeared in Garden; it now creates a new Garden plant from the batch's own details
+  and links the batch to it.
+
+- **Planting out finds the plant already in Garden.** When a batch isn't linked to a Garden plant,
+  or its plant has been deleted, the plant-out form looks for Garden plants with the same botanical
+  name and offers to add to one of them rather than create a second record of it. *Create a new
+  Garden plant* is still there. A linked batch says which Garden plant it will add to.
+
+- **Deleting a Garden plant says how many nursery batches link to it.** They keep the name and
+  details stored on the batch; only the link stops working.
+
 ## 2026-09-12
 
 **Action required: none.** No new collection, no rules change, no environment variable.

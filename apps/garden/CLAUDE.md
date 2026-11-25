@@ -34,7 +34,7 @@ Environment variables on the Garden site:
 | `FIREBASE_MESSAGING_SENDER_ID` | ” |
 | `FIREBASE_APP_ID` | ” |
 | `GEMINI_API_KEY` | Google AI Studio key for the label-scan and plant-lookup functions. Set and verified working. |
-| `GEMINI_MODEL` | Optional; defaults to `gemini-flash-latest` |
+| `GEMINI_MODEL` | Optional. The code falls back to `gemini-3.5-flash`; set `gemini-flash-latest` to always track the newest Flash |
 | `GEMINI_MODEL_RESEARCH` | Not set — research runs on full Flash since the 30s timeout increase. Only needed if that is ever lost. |
 | `LOOKUP_BUDGET_MS` | `27000`, just inside Netlify's 30s function timeout. Code default is 8500. |
 
@@ -60,7 +60,7 @@ apps/garden/
 ├── functions/               ← 2 Netlify serverless functions, both calling Gemini
 │   ├── scan-label.js        ← reads a printed plant label from photos
 │   └── lookup-plant.js      ← researches a plant from its name, with web search
-└── js/                      ← 17 ES modules
+└── js/                      ← 18 ES modules
 ```
 
 `compress-photos.html` is a self-contained one-off page that re-compresses existing photos in
@@ -69,22 +69,23 @@ navigation. It ships with the site but nothing in `js/` depends on it.
 
 ---
 
-## JS module map (17 modules)
+## JS module map (18 modules)
 
 | File | Responsibility | Key exports |
 |---|---|---|
-| `main.js` | Entry point: router, auth state listener, nav wiring | *(no exports — entry point)* |
-| `db.js` | Every Firestore + Storage read/write. ~1030 lines, the biggest module. | `initFirebase`, `getPlants`/`addPlant`/`updatePlant`/`deletePlant`, `getAreas`/`addArea`/…, `getInstances*`/`addInstance`/…, `getDeceasedPlants`, `recordPlantDeath`, `transferToNursery`, `getNurseryLocations`, `getTasks`/`addTask`/…, `getTaskAssignments*`/…, photo helpers (`uploadPhoto`, `getPhotosForPlant`, `updatePhotoOrders`, `uploadAreaPhoto`, …), `getIrrigationZones`/`addIrrigationZone`/…, `getIrrigationLogs*`/…, `getSuggestions`/…, `nextOccurrenceDate`, `firstOccurrenceFromToday`, `createNextRecurringOccurrence`, `getBlogPosts`/`saveBlogPost`/`uploadBlogPhoto`/…, `exportAllData`, `importAllData`, `clearAllData`, `getDataCounts`, `formatBotanicalName`, `hybridTypeOf`, `getUsers`, `updateUserRole`, `setUserBlocked`, `getPendingUserCount`, `escHtml`, `isTagCode`, `getPlantByTagCode`, `ensureTagCode` |
+| `main.js` | Entry point: router, auth state listener, nav wiring. Overview, the walk-round, Irrigation, the blog and Admin are `import()`ed when first opened (`lazy` at the top), then fetched in the background a few seconds after launch so they still open offline | *(no exports — entry point)* |
+| `garden-logic.js` | Pure helpers with **no imports**, so `tests/` can load them in Node: names, escaping, `linkify`, dates, repeat dates, tag codes. `db.js` re-exports all of it, so views import from `db.js` as before | `formatBotanicalName`, `plainPlantName`, `hybridTypeOf`, `escHtml`, `linkify`, `fmtDate`, `fmtDateLong`, `todayStr`, `isOverdue`, `nextOccurrenceDate`, `firstOccurrenceFromToday`, `isTagCode` |
+| `db.js` | Every Firestore + Storage read/write. ~1030 lines, the biggest module. | `initFirebase`, `getPlants`/`addPlant`/`updatePlant`/`deletePlant`, `getAreas`/`addArea`/…, `getInstances*`/`addInstance`/…, `getDeceasedPlants`, `recordPlantDeath`, `transferToNursery`, `getNurseryLocations`, `countNurseryBatchesForPlant`, `getTasks`/`addTask`/…, `getTaskAssignments*`/…, photo helpers (`uploadPhoto`, `getPhotosForPlant`, `updatePhotoOrders`, `uploadAreaPhoto`, …), `getIrrigationZones`/`addIrrigationZone`/…, `getIrrigationLogs*`/…, `getSuggestions`/…, `nextOccurrenceDate`, `firstOccurrenceFromToday`, `createNextRecurringOccurrence`, `getBlogPosts`/`saveBlogPost`/`uploadBlogPhoto`/…, `exportAllData`, `importAllData`, `clearAllData`, `getDataCounts`, `formatBotanicalName`, `hybridTypeOf`, `getUsers`, `updateUserRole`, `setUserBlocked`, `getPendingUserCount`, `escHtml`, `linkify` (escHtml plus clickable http/https URLs, for free-text fields), `isTagCode`, `getPlantByTagCode`, `ensureTagCode` |
 | `auth.js` | Auth state, role cache, sign-in helpers. **Byte-identical to Nursery's — see `tools/check-drift.mjs`.** | `initAuth`, `getAuthInstance`, `getCurrentUser`, `getCurrentRole`, `isAtLeast`, `loadRole`, `setCurrentUser`, `setRole`, `signInWithGoogle`, `signInWithEmail`, `signInAsGuest`, `signOutUser` |
-| `ui-utils.js` | Modal, toast, carousel, drag-sort, date picker | `navigate`, `goBack`, `showModal`, `hideModal`, `showToast`, `initPhotoCarousel`, `initPhotoDragSort`, `datePicker`, `initDatePickers` |
+| `ui-utils.js` | Modal, toast, carousel, drag-sort, date picker | `navigate`, `goBack`, `showModal`, `hideModal`, `isModalOpen`, `requestCloseModal` (closes, asking first if the form was touched — for the overlay, the ✕ and Back; Cancel and Save use `hideModal`), `showToast`, `initPhotoCarousel`, `initPhotoDragSort`, `datePicker`, `initDatePickers` |
 | `auth-view.js` | Login / access-denied overlay | `showLoginOverlay`, `hideLoginOverlay`, `showAccessDenied` |
 | `garden-view.js` | Overview dashboard | `renderGardenView` |
-| `plants-view.js` | Plants list, plant detail, plant form | `renderPlantsList`, `renderPlantDetail`, `clearPlantSearch`, `showPlantForm`, `showAddPlantToAreaModal`, `showDeathModal` |
+| `plants-view.js` | Plants list (drawn 60 cards at a time by an `IntersectionObserver`, one delegated click listener, A–Z strip, filters; `listState` holds search, filters and depth so Back restores them), plant detail, plant form | `renderPlantsList`, `renderPlantDetail`, `clearPlantSearch`, `showPlantForm`, `showAddPlantToAreaModal`, `showDeathModal` |
 | `areas-view.js` | Areas list, area detail (plants / tasks / gallery tabs) | `renderAreasList`, `renderAreaDetail`, `showAreaForm` |
 | `walkround-view.js` | Walk-round: inventory one area on a phone — tick off each plant, record what happened to the missing, add the unlisted. Route `#area-walk/<areaId>`. | `renderWalkRound` |
 | `tasks-view.js` | Tasks: recurring, by-area, by-status | `renderTasksView`, `renderAreaTasksSection`, `buildTaskRow`, `attachTaskHandlers`, `showTaskForm`, `showAssignExistingTaskModal`, `updateNavBadge`, `GENERAL_AREA_ID` |
 | `irrigation-view.js` | Irrigation zones and watering logs (~74 KB, the largest view) | `renderIrrigationView`, `getIrrigationBannerInfo` |
-| `blog-view.js` | Blog/Journal list, post reader, admin editor (Quill) | `renderBlogList`, `renderBlogPost`, `renderBlogEditor` |
+| `blog-view.js` | Blog/Journal list, post reader, admin editor (Quill). Loads Quill itself: the stylesheet for a post, the script too for the editor. It is not in `index.html` | `renderBlogList`, `renderBlogPost`, `renderBlogEditor` |
 | `compost-view.js` | Compost Bin: deceased-plant log, grouped by month | `renderCompostView`, `DEATH_CAUSES`, `causeMeta` |
 | `label-scan.js` | Client half of the Gemini label scan; compresses images and POSTs to the function. **Near-identical to Nursery's.** | `scanPanelHTML`, `focusScanCard`, `initLabelScan` |
 | `plant-lookup.js` | Client half of the AI plant lookup. Offers the two tracks, previews the result, appends to Notes on request. **Byte-identical to Nursery's** — field IDs are passed in. | `lookupPanelHTML`, `initPlantLookup` |
@@ -114,6 +115,8 @@ settings recorded there for the 30-second function timeout granted 2026-08-18.
 **Transfer to Nursery.** `transferToNursery()` in `db.js` sends a Garden plant to Nursery as a new
 batch, and `getNurseryLocations()` reads Nursery's `nursery_locations` so the form can offer a
 destination. This is the Garden→Nursery direction; Nursery's `plantOutToGarden()` is the return leg.
+Deleting a plant first asks `countNurseryBatchesForPlant()`, so the confirm can say how many Nursery
+batches link to it. The batches are left alone: each keeps its own name and details.
 
 **Botanical naming.** `formatBotanicalName()` and `hybridTypeOf()` implement the hybrid nomenclature
 rules. The `plants` doc carries the full set — `genus`, `species`, `subspecies`, `variety`,
@@ -142,10 +145,11 @@ through `showAddPlantToAreaModal`, label scan included. It stores **only fields 
 documents**, so no rules change: `instances.lastSeen` and `instances.notFoundOn` (YYYY-MM-DD),
 `areas.walkRoundStarted` (set while in progress, `null` otherwise) and `areas.lastWalkRound`. A
 plant is checked on the current walk-round when `lastSeen >= walkRoundStarted`, which is why progress
-resumes on any device. **Writes are tracked, not awaited:** out of signal Firestore's promise does not
-settle until the server has the write, and the memory cache means closing the page loses anything
-unsent — so ticks update the screen at once, a refused write is rolled back with a toast, and a
-`beforeunload` guard warns while writes are waiting. Death, add-plant and new-plant still await, as
+resumes on any device. **Writes are tracked, not awaited:** ticks update the screen at once and a refused
+write is rolled back with a toast. This predates the app-wide offline cache (root `CLAUDE.md`,
+*Offline*). Since 2026-11 unsent writes survive closing the page, and `queued()` settles each
+write after a few seconds, so the `beforeunload` guard and the "keep this page open" wording are
+now more cautious than they need to be. Harmless; simplify when next in that file. Death, add-plant and new-plant still await, as
 they do everywhere else.
 
 **UX notes and improvement ideas:** [`docs/ux-review.md`](../../docs/ux-review.md).
@@ -162,6 +166,8 @@ both live entirely in `js/plants-view.js` and a marked block at the end of `styl
   plant detail, and as a filter panel (funnel button in the Plants search bar). Within a category
   a filter matches ANY selected tag; across categories a plant must match EVERY active category.
   No rules change — they are ordinary fields on an existing collection.
+  Since v2.2 the panel sits above upstream's Not placed / No photo / area filters and its state
+  (`tags`, `ownership`) lives in the module's `listState`, so Back restores it with the search.
 - **Wishlist.** An ordinary area named `Wishlist` (case-insensitive) stands for plants wanted but
   not owned. `ownershipStatusFromAreas()` treats a plant as Wishlist only when that area is its
   *only* location; no location, or any real area, counts as Owned. Wishlist plants get an amber

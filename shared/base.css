@@ -202,6 +202,57 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Set on .app-main by route() in main.js while the next screen's data is on
+   its way. The outgoing screen dims and stops taking taps, and a bar runs
+   under the header. Both wait 120ms, so a screen that arrives at once does
+   not flicker. */
+.app-main.is-loading {
+    pointer-events: none;
+    animation: screenDim 0.2s ease 0.12s both;
+}
+.app-main.is-loading::before {
+    content: '';
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    width: 40%;
+    height: 3px;
+    background: var(--green-500);
+    z-index: 90;
+    animation: loadingBar 1.1s ease-in-out 0.12s infinite both;
+}
+@keyframes screenDim  { from { opacity: 1; } to { opacity: 0.45; } }
+@keyframes loadingBar {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(250%); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .app-main.is-loading::before { animation: none; width: 100%; }
+}
+
+/* Offline / sending pill, drawn by initSyncIndicator() in ui-utils.js. Sits
+   just under the header, out of the way of the + button and the toasts. */
+.sync-pill {
+    position: fixed;
+    top: calc(var(--header-h) + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100vw - 24px);
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: var(--grey-800);
+    color: var(--white);
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-align: center;
+    box-shadow: var(--shadow-md);
+    z-index: 95;
+    pointer-events: none;
+    display: none;
+}
+.sync-pill.visible { display: block; }
+.sync-pill.offline { background: #8a5a00; }
+
 /* --- Bottom Navigation --- */
 .bottom-nav {
     position: fixed;
@@ -241,3 +292,8 @@ body {
     transition: transform var(--transition);
 }
 .nav-btn.active .nav-icon { transform: scale(1.1); }
+
+/* --- Tap targets, 2026-11 --- */
+/* Back was 32px high, under the 44px a finger needs. The header is 60px, so
+   there is room. */
+.back-btn { min-height: 44px; }

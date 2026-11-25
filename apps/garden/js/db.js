@@ -4,10 +4,12 @@
 
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import {
-    getFirestore,
+    getFirestore, initializeFirestore,
+    persistentLocalCache, persistentMultipleTabManager,
     collection, doc,
-    addDoc, setDoc, updateDoc, deleteDoc,
-    getDocs, getDoc,
+    setDoc as fsSetDoc, updateDoc as fsUpdateDoc, deleteDoc as fsDeleteDoc,
+    writeBatch,
+    getDocs, getDoc, getCountFromServer,
     query, orderBy, where, limit,
     serverTimestamp
 } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
@@ -18,9 +20,192 @@ import {
 import imageCompression from 'https://cdn.jsdelivr.net/npm/browser-image-compression@2/dist/browser-image-compression.mjs';
 
 import { firebaseConfig } from '../firebase-config.js';
+import {
+    TAG_CODE_ALPHABET, TAG_CODE_LENGTH, isTagCode, nextOccurrenceDate, firstOccurrenceFromToday,
+    formatBotanicalName, hybridTypeOf, plainPlantName, escHtml, linkify,
+    fmtDate, fmtDateLong, todayStr, isOverdue
+} from './garden-logic.js';
+// The pure helpers live in garden-logic.js so Node can test them; they are
+// re-exported here so every view still imports from './db.js'.
+export {
+    isTagCode, nextOccurrenceDate, firstOccurrenceFromToday,
+    formatBotanicalName, hybridTypeOf, plainPlantName, escHtml, linkify,
+    fmtDate, fmtDateLong, todayStr, isOverdue
+};
 
 // ---------- Initialise Firebase ----------
 let app, db, storage;
+
+// =============================================
+//  Offline: a cache on the device, and writes that queue
+// =============================================
+// Added 2026-11. Two things make the app usable with poor or no signal.
+//
+// 1. Firestore keeps its data in IndexedDB on the device (see initFirebase).
+//    A read with no connection is answered from that copy, and a write made
+//    with no connection is stored there and sent when the connection returns,
+//    even if the app has been closed in between.
+//
+// 2. Every write in this file goes through queued(). Firestore's own write
+//    promise does not settle until the SERVER has the write, so out of signal
+//    an awaited save would leave its form on "Saving…" for as long as you stay
+//    out of range. queued() waits a few seconds for the server and then lets
+//    the caller carry on: the write is already safe in the local cache and is
+//    in every read from that moment.
+//
+// The cost of (2): a write the server later REFUSES (the security rules) can no
+// longer fail the form that made it once queued() has let go. That is announced
+// with a 'write-failed' event instead, which ui-utils turns into a toast. When
+// the server is reachable a refusal arrives well inside the wait, so the form
+// still sees it as before.
+//
+// addDoc, setDoc, updateDoc and deleteDoc below shadow Firestore's own, which
+// are imported under fs* names, so the rest of this file reads as it always
+// did and cannot bypass the queue by accident.
+
+const ACK_WAIT_MS         = 5000;  // online: how long to wait for the server
+const ACK_WAIT_OFFLINE_MS = 300;   // browser already says we are offline
+
+let unsynced = 0;                  // writes the server has not confirmed yet
+
+function announceSync() {
+    window.dispatchEvent(new CustomEvent('sync-state', { detail: { unsynced } }));
+}
+
+function queued(serverPromise) {
+    unsynced++;
+    announceSync();
+    let acked = false, released = false;
+    const settled = serverPromise.then(
+        value => { acked = true; unsynced--; announceSync(); return value; },
+        err   => {
+            acked = true; unsynced--; announceSync();
+            if (released) {
+                console.error('A queued write was refused:', err);
+                window.dispatchEvent(new CustomEvent('write-failed', { detail: err }));
+            }
+            throw err;
+        }
+    );
+    return new Promise((resolve, reject) => {
+        settled.then(resolve, err => { if (!released) reject(err); });
+        setTimeout(() => {
+            if (!acked) { released = true; resolve(undefined); }
+        }, navigator.onLine ? ACK_WAIT_MS : ACK_WAIT_OFFLINE_MS);
+    });
+}
+
+// addDoc must hand back the new document's reference straight away, so the id
+// is made on the device (which is all Firestore's addDoc does) and written
+// with setDoc.
+function addDoc(collectionRef, data) {
+    const ref = doc(collectionRef);
+    forget(collectionRef.id);
+    return queued(fsSetDoc(ref, data)).then(() => ref);
+}
+// Each also drops the remembered copy of the collection it writes to (see
+// "Remembered collections" below). ref.parent.id is the collection's name.
+const touched   = ref => { forget(ref.parent.id); return ref; };
+const setDoc    = (ref, ...rest) => queued(fsSetDoc(touched(ref), ...rest));
+const updateDoc = (ref, ...rest) => queued(fsUpdateDoc(touched(ref), ...rest));
+const deleteDoc = (ref, ...rest) => queued(fsDeleteDoc(touched(ref), ...rest));
+
+// Writes that belong together go to the server as one step: all of them
+// happen, or none do. Without this, a connection dropped between two awaits
+// left half a change behind, such as a death recorded with the plant still
+// shown in its area. A batch queues offline exactly as a single write does,
+// and counts as one change on the sync pill.
+//
+//     await commitTogether(b => { b.set(refA, dataA); b.delete(refB); });
+function commitTogether(build) {
+    const batch = writeBatch(db);
+    build({
+        set:    (ref, ...rest) => batch.set(touched(ref), ...rest),
+        update: (ref, ...rest) => batch.update(touched(ref), ...rest),
+        delete: ref            => batch.delete(touched(ref)),
+    });
+    return queued(batch.commit());
+}
+
+// Delete a list of documents together. Put a parent LAST: a list too long for
+// one batch goes in several, and if it stops partway the parent is still
+// there, so the delete can simply be run again.
+const BATCH_MAX = 450;
+async function deleteTogether(refs) {
+    for (let i = 0; i < refs.length; i += BATCH_MAX) {
+        const chunk = refs.slice(i, i + BATCH_MAX);
+        await commitTogether(b => chunk.forEach(r => b.delete(r)));
+    }
+}
+
+// =============================================
+//  Remembered collections
+// =============================================
+// Added 2026-11. Every screen used to download whole collections again each
+// time it drew, so tapping a filter chip on Tasks fetched five collections to
+// re-filter what was already on the phone. A whole-collection read is now
+// kept in memory and handed back until one of these happens:
+//
+//   - this app writes to that collection (the write functions above do it,
+//     so a new write function needs nothing special);
+//   - the app comes back to the foreground, or the connection returns;
+//   - two minutes pass.
+//
+// The last two are for changes made somewhere else: the other app, or another
+// person's phone. Until one of them happens such a change is not seen, which
+// is the price of not asking the server on every tap.
+//
+// Only whole-collection reads are kept. A read of one document, or of one
+// plant's or one batch's records, still asks Firestore each time: those are
+// small, and several of them feed a calculation that is then written back.
+//
+// Callers get copies, so a view can sort or change what it is given.
+const REMEMBER_MS = 2 * 60 * 1000;
+const remembered  = new Map();     // collection name -> { at, list, promise }
+
+function forget(...names) {
+    if (names.length) names.forEach(n => remembered.delete(n));
+    else remembered.clear();
+}
+const copies = list => list.map(item => ({ ...item }));
+function current(name) {
+    const entry = remembered.get(name);
+    return entry && Date.now() - entry.at < REMEMBER_MS ? entry : null;
+}
+/** The whole collection, from memory if it is there, else from fetch(). */
+async function whole(name, fetch) {
+    let entry = current(name);
+    if (!entry) {
+        entry = { at: Date.now(), list: null };
+        // A write that lands while this is in flight removes the entry, so the
+        // answer goes to whoever is already waiting and is not kept.
+        entry.promise = fetch().then(
+            list => { entry.list = list; return list; },
+            err  => { if (remembered.get(name) === entry) remembered.delete(name); throw err; }
+        );
+        remembered.set(name, entry);
+    }
+    return copies(await entry.promise);
+}
+/** The collection if it is already in memory, else null. Never fetches. */
+function held(name) {
+    const entry = current(name);
+    return entry && entry.list ? copies(entry.list) : null;
+}
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') forget();
+});
+window.addEventListener('online', () => forget());
+
+/** How many documents a query matches, without downloading them. The server
+ *  has to answer this, so offline it falls back to counting the device's copy. */
+async function countOf(q) {
+    try {
+        return (await getCountFromServer(q)).data().count;
+    } catch (_) {
+        return (await getDocs(q)).size;
+    }
+}
 
 /**
  * Initialise Firebase.
@@ -34,7 +219,18 @@ export function initFirebase() {
     }
     try {
         app     = initializeApp(firebaseConfig);
-        db      = getFirestore(app);
+        // Keep the data on the device so the app works without signal. The
+        // tab manager lets two tabs of the app share that one copy. A browser
+        // that refuses IndexedDB (some private windows) falls back to the
+        // in-memory cache the app used before: it works, online only.
+        try {
+            db = initializeFirestore(app, {
+                localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+            });
+        } catch (e) {
+            console.warn('Offline cache unavailable, continuing online-only:', e);
+            db = getFirestore(app);
+        }
         storage = getStorage(app);
         return { app, db, storage };
     } catch (e) {
@@ -48,7 +244,8 @@ export function initFirebase() {
 // =============================================
 
 /** Fetch all plants, ordered by genus (secondary sort done in JS to avoid index requirements) */
-export async function getPlants() {
+export function getPlants() { return whole('plants', fetchPlants); }
+async function fetchPlants() {
     const q = query(collection(db, 'plants'), orderBy('genus'));
     const snap = await getDocs(q);
     const plants = snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -101,13 +298,7 @@ export async function updatePlant(id, data) {
 // Crockford's Base32 alphabet: no I, L, O or U, so nothing on a printed tag
 // can be misread as something else, and every character is legal in QR
 // alphanumeric mode. See docs/plant-tags.md.
-const TAG_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-const TAG_CODE_LENGTH   = 6;
 
-/** Is this path segment shaped like a tag code rather than a Firestore ID? */
-export function isTagCode(value) {
-    return new RegExp(`^[${TAG_CODE_ALPHABET}]{${TAG_CODE_LENGTH}}$`).test(String(value || '').toUpperCase());
-}
 
 function randomTagCode() {
     const bytes = new Uint8Array(TAG_CODE_LENGTH);
@@ -157,27 +348,33 @@ export async function ensureTagCode(plant) {
 
 /** Delete a plant and all its instances and photos */
 export async function deletePlant(id) {
-    // Delete instances
+    // Find the instances and photos first
     const instancesSnap = await getDocs(
         query(collection(db, 'instances'), where('plantId', '==', id))
     );
-    for (const d of instancesSnap.docs) {
-        await deleteDoc(d.ref);
-    }
-    // Delete photos — Storage file first, then Firestore metadata document
     const photosSnap = await getDocs(
         query(collection(db, 'photos'), where('plantId', '==', id))
     );
+    // The records go together, the plant last.
+    await deleteTogether([
+        ...instancesSnap.docs.map(d => d.ref),
+        ...photosSnap.docs.map(d => d.ref),
+        doc(db, 'plants', id),
+    ]);
+    // Then the photo files. Storage has no offline queue and cannot join a
+    // batch, so these are not waited for: a file that cannot be removed now is
+    // left behind in Storage, where nothing points at it any more.
     for (const d of photosSnap.docs) {
-        // Try to delete from storage
-        try {
-            const storageRef = ref(storage, d.data().storagePath);
-            await deleteObject(storageRef);
-        } catch (_) { /* ignore if already gone */ }
-        await deleteDoc(d.ref);
+        const path = d.data().storagePath;
+        if (path) deleteObject(ref(storage, path)).catch(() => { /* already gone, or offline */ });
     }
-    // Delete the plant itself
-    await deleteDoc(doc(db, 'plants', id));
+}
+
+/** How many Nursery batches link to a plant, for the delete warning. Deleting
+ *  the plant leaves them alone: each keeps the name and details stored on it,
+ *  and Nursery treats the dead link as no link. */
+export async function countNurseryBatchesForPlant(plantId) {
+    return countOf(query(collection(db, 'nursery_batches'), where('plantId', '==', plantId)));
 }
 
 // =============================================
@@ -185,7 +382,8 @@ export async function deletePlant(id) {
 // =============================================
 
 /** Fetch all areas */
-export async function getAreas() {
+export function getAreas() { return whole('areas', fetchAreas); }
+async function fetchAreas() {
     const q = query(collection(db, 'areas'), orderBy('name'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -219,17 +417,15 @@ export async function deleteArea(id) {
     const instancesSnap = await getDocs(
         query(collection(db, 'instances'), where('areaId', '==', id))
     );
-    for (const d of instancesSnap.docs) {
-        await deleteDoc(d.ref);
-    }
     // Also remove any task assignments scoped to this area
     const assignmentsSnap = await getDocs(
         query(collection(db, 'taskAssignments'), where('areaId', '==', id))
     );
-    for (const d of assignmentsSnap.docs) {
-        await deleteDoc(d.ref);
-    }
-    await deleteDoc(doc(db, 'areas', id));
+    await deleteTogether([
+        ...instancesSnap.docs.map(d => d.ref),
+        ...assignmentsSnap.docs.map(d => d.ref),
+        doc(db, 'areas', id),
+    ]);
 }
 
 // =============================================
@@ -237,7 +433,8 @@ export async function deleteArea(id) {
 // =============================================
 
 /** Get all instances */
-export async function getInstances() {
+export function getInstances() { return whole('instances', fetchInstances); }
+async function fetchInstances() {
     const snap = await getDocs(collection(db, 'instances'));
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
@@ -284,7 +481,8 @@ export async function deleteInstance(id) {
 //  area while still alive in another.
 
 /** Get all deceased records, newest death first (sorted in JS — no index needed) */
-export async function getDeceasedPlants() {
+export function getDeceasedPlants() { return whole('deceasedPlants', fetchDeceasedPlants); }
+async function fetchDeceasedPlants() {
     const snap = await getDocs(collection(db, 'deceasedPlants'));
     const recs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     return recs.sort((a, b) => (b.diedDate || '').localeCompare(a.diedDate || ''));
@@ -298,29 +496,28 @@ export async function getDeceasedForPlant(plantId) {
 }
 
 /**
- * Record a plant death. Creates a deceasedPlants document, then adjusts the
- * source instance: if the whole quantity died the instance is removed,
- * otherwise its quantity is reduced by the number that died.
+ * Record a plant death. Creates a deceasedPlants document and adjusts the
+ * source instance in one step: if the whole quantity died the instance is
+ * removed, otherwise its quantity is reduced by the number that died.
  *
  * @param {object} record   { plantId, plantName, commonName, areaId, areaName,
  *                            quantity, cause, notes, diedDate }
  * @param {object} instance { id, quantity } — the location the death came from
  */
 export async function recordPlantDeath(record, instance) {
-    await addDoc(collection(db, 'deceasedPlants'), {
-        ...record,
-        createdAt: serverTimestamp()
-    });
-
-    if (instance && instance.id) {
-        const had  = instance.quantity || 1;
-        const died = record.quantity   || 1;
-        if (died >= had) {
-            await deleteDoc(doc(db, 'instances', instance.id));
-        } else {
-            await updateDoc(doc(db, 'instances', instance.id), { quantity: had - died });
+    await commitTogether(b => {
+        b.set(doc(collection(db, 'deceasedPlants')), {
+            ...record,
+            createdAt: serverTimestamp()
+        });
+        if (instance && instance.id) {
+            const had  = instance.quantity || 1;
+            const died = record.quantity   || 1;
+            const instanceRef = doc(db, 'instances', instance.id);
+            if (died >= had) b.delete(instanceRef);
+            else             b.update(instanceRef, { quantity: had - died });
         }
-    }
+    });
 }
 
 /** Delete a deceased record (removes the Compost Bin entry — does not replant) */
@@ -336,7 +533,8 @@ export async function deleteDeceasedRecord(id) {
 
 /** Read the Nursery Management locations list (for the transfer location picker).
  *  No orderBy — sort client-side to avoid a composite index requirement. */
-export async function getNurseryLocations() {
+export function getNurseryLocations() { return whole('nursery_locations', fetchNurseryLocations); }
+async function fetchNurseryLocations() {
     const snap = await getDocs(collection(db, 'nursery_locations'));
     return snap.docs
         .map(d => ({ id: d.id, ...d.data() }))
@@ -347,25 +545,25 @@ export async function getNurseryLocations() {
  * Transfer plants from the garden into the Nursery Management app.
  * Writes a new nursery_batches document (shape compatible with the Nursery
  * schema) and reduces / removes the source garden instance by the quantity
- * moved (mirrors recordPlantDeath). `instance` is { id, quantity }.
+ * moved, in one step (mirrors recordPlantDeath). `instance` is { id, quantity }.
  * Returns the new batch DocumentReference.
  */
 export async function transferToNursery(batchData, instance) {
-    const batchRef = await addDoc(collection(db, 'nursery_batches'), {
-        ...batchData,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-    });
-
-    if (instance && instance.id) {
-        const had   = instance.quantity || 1;
-        const moved = batchData.startQty || 1;
-        if (moved >= had) {
-            await deleteDoc(doc(db, 'instances', instance.id));
-        } else {
-            await updateDoc(doc(db, 'instances', instance.id), { quantity: had - moved });
+    const batchRef = doc(collection(db, 'nursery_batches'));
+    await commitTogether(b => {
+        b.set(batchRef, {
+            ...batchData,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+        });
+        if (instance && instance.id) {
+            const had   = instance.quantity || 1;
+            const moved = batchData.startQty || 1;
+            const instanceRef = doc(db, 'instances', instance.id);
+            if (moved >= had) b.delete(instanceRef);
+            else              b.update(instanceRef, { quantity: had - moved });
         }
-    }
+    });
     return batchRef;
 }
 
@@ -374,7 +572,8 @@ export async function transferToNursery(batchData, instance) {
 // =============================================
 
 /** Fetch all tasks, ordered by title */
-export async function getTasks() {
+export function getTasks() { return whole('tasks', fetchTasks); }
+async function fetchTasks() {
     const q = query(collection(db, 'tasks'), orderBy('title'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -408,10 +607,7 @@ export async function deleteTask(id) {
     const assignmentsSnap = await getDocs(
         query(collection(db, 'taskAssignments'), where('taskId', '==', id))
     );
-    for (const d of assignmentsSnap.docs) {
-        await deleteDoc(d.ref);
-    }
-    await deleteDoc(doc(db, 'tasks', id));
+    await deleteTogether([...assignmentsSnap.docs.map(d => d.ref), doc(db, 'tasks', id)]);
 }
 
 // =============================================
@@ -419,7 +615,8 @@ export async function deleteTask(id) {
 // =============================================
 
 /** Get all task assignments */
-export async function getTaskAssignments() {
+export function getTaskAssignments() { return whole('taskAssignments', fetchTaskAssignments); }
+async function fetchTaskAssignments() {
     const snap = await getDocs(collection(db, 'taskAssignments'));
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
@@ -464,9 +661,7 @@ export async function deleteTaskAssignmentsForArea(areaId) {
     const snap = await getDocs(
         query(collection(db, 'taskAssignments'), where('areaId', '==', areaId))
     );
-    for (const d of snap.docs) {
-        await deleteDoc(d.ref);
-    }
+    await deleteTogether(snap.docs.map(d => d.ref));
 }
 
 // =============================================
@@ -508,34 +703,36 @@ export async function getPhotosForPlant(plantId) {
  * Returns a promise that resolves with the photo document ID.
  * Calls onProgress(pct) with upload % (0–100).
  */
-export async function uploadPhoto(plantId, file, onProgress) {
+/**
+ * Compress a picture and put it in Storage under <folder>/<ownerId>/.
+ * Resolves with { url, path }. The three upload functions below differ only
+ * in the folder and in what record, if any, they write afterwards.
+ */
+async function uploadToStorage(folder, ownerId, file, onProgress) {
     const fileToUpload = await compressImage(file);
-    return new Promise((resolve, reject) => {
-        const ext        = file.name.split('.').pop();
-        const filename   = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-        const path       = `plant-photos/${plantId}/${filename}`;
-        const storageRef = ref(storage, path);
-        const task       = uploadBytesResumable(storageRef, fileToUpload);
+    const ext      = file.name.split('.').pop();
+    const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+    const path     = `${folder}/${ownerId}/${filename}`;
+    const task     = uploadBytesResumable(ref(storage, path), fileToUpload);
+    await new Promise((resolve, reject) => task.on('state_changed',
+        snap => { if (onProgress) onProgress((snap.bytesTransferred / snap.totalBytes) * 100); },
+        reject,
+        resolve
+    ));
+    return { url: await getDownloadURL(task.snapshot.ref), path };
+}
 
-        task.on('state_changed',
-            snap => {
-                const pct = (snap.bytesTransferred / snap.totalBytes) * 100;
-                if (onProgress) onProgress(pct);
-            },
-            err => reject(err),
-            async () => {
-                const url = await getDownloadURL(task.snapshot.ref);
-                const docRef = await addDoc(collection(db, 'photos'), {
-                    plantId,
-                    url,
-                    storagePath: path,
-                    filename: file.name,
-                    createdAt: serverTimestamp()
-                });
-                resolve(docRef.id);
-            }
-        );
+/** Upload a plant photo and record it. Resolves with the photo record's id. */
+export async function uploadPhoto(plantId, file, onProgress) {
+    const { url, path } = await uploadToStorage('plant-photos', plantId, file, onProgress);
+    const docRef = await addDoc(collection(db, 'photos'), {
+        plantId,
+        url,
+        storagePath: path,
+        filename: file.name,
+        createdAt: serverTimestamp()
     });
+    return docRef.id;
 }
 
 /**
@@ -546,31 +743,42 @@ export async function getFirstPhotoForPlants(plantIds) {
     if (!plantIds.length) return {};
     const CHUNK = 30;
     const map   = {};
+    const consider = data => {
+        const pid    = data.plantId;
+        const curr   = map[pid];
+        const dOrder = data.order ?? Infinity;
+        const cOrder = curr?.order ?? Infinity;
+        if (!curr || dOrder < cOrder ||
+            (dOrder === cOrder &&
+             (data.createdAt?.toMillis?.() ?? 0) < (curr.createdAt?.toMillis?.() ?? 0))) {
+            map[pid] = data;
+        }
+    };
+    // If the Plants list has already brought every photo record down, pick
+    // from those rather than asking again in chunks of 30.
+    const all = held('photos');
+    if (all) {
+        const wanted = new Set(plantIds);
+        all.forEach(p => { if (wanted.has(p.plantId)) consider(p); });
+        return map;
+    }
     for (let i = 0; i < plantIds.length; i += CHUNK) {
         const chunk = plantIds.slice(i, i + CHUNK);
         const q     = query(collection(db, 'photos'), where('plantId', 'in', chunk));
         const snap  = await getDocs(q);
-        snap.docs.forEach(d => {
-            const data   = { id: d.id, ...d.data() };
-            const pid    = data.plantId;
-            const curr   = map[pid];
-            const dOrder = data.order ?? Infinity;
-            const cOrder = curr?.order ?? Infinity;
-            if (!curr || dOrder < cOrder ||
-                (dOrder === cOrder &&
-                 (data.createdAt?.toMillis?.() ?? 0) < (curr.createdAt?.toMillis?.() ?? 0))) {
-                map[pid] = data;
-            }
-        });
+        snap.docs.forEach(d => consider({ id: d.id, ...d.data() }));
     }
     return map;
 }
 
 /** Return a Set of plantIds that have at least one photo */
 export async function getPlantIdsWithPhotos() {
-    const snap = await getDocs(collection(db, 'photos'));
-    const ids  = new Set();
-    snap.docs.forEach(d => { const pid = d.data().plantId; if (pid) ids.add(pid); });
+    const photos = await whole('photos', async () => {
+        const snap = await getDocs(collection(db, 'photos'));
+        return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    });
+    const ids = new Set();
+    photos.forEach(p => { if (p.plantId) ids.add(p.plantId); });
     return ids;
 }
 
@@ -600,9 +808,10 @@ export async function getPhotosForArea(areaId) {
 
 /** Persist a new display order for a set of photos */
 export async function updatePhotoOrders(orderedIds) {
-    await Promise.all(
-        orderedIds.map((id, idx) => updateDoc(doc(db, 'photos', id), { order: idx }))
-    );
+    if (!orderedIds.length) return;
+    await commitTogether(b => {
+        orderedIds.forEach((id, idx) => b.update(doc(db, 'photos', id), { order: idx }));
+    });
 }
 
 /**
@@ -610,32 +819,15 @@ export async function updatePhotoOrders(orderedIds) {
  * Compresses the image to ≤500 KB / 1920 px before uploading if needed.
  */
 export async function uploadAreaPhoto(areaId, file, onProgress) {
-    const fileToUpload = await compressImage(file);
-    return new Promise((resolve, reject) => {
-        const ext        = file.name.split('.').pop();
-        const filename   = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-        const path       = `area-photos/${areaId}/${filename}`;
-        const storageRef = ref(storage, path);
-        const task       = uploadBytesResumable(storageRef, fileToUpload);
-        task.on('state_changed',
-            snap => {
-                const pct = (snap.bytesTransferred / snap.totalBytes) * 100;
-                if (onProgress) onProgress(pct);
-            },
-            err => reject(err),
-            async () => {
-                const url = await getDownloadURL(task.snapshot.ref);
-                const docRef = await addDoc(collection(db, 'photos'), {
-                    areaId,
-                    url,
-                    storagePath: path,
-                    filename: file.name,
-                    createdAt: serverTimestamp()
-                });
-                resolve(docRef.id);
-            }
-        );
+    const { url, path } = await uploadToStorage('area-photos', areaId, file, onProgress);
+    const docRef = await addDoc(collection(db, 'photos'), {
+        areaId,
+        url,
+        storagePath: path,
+        filename: file.name,
+        createdAt: serverTimestamp()
     });
+    return docRef.id;
 }
 
 // =============================================
@@ -644,7 +836,8 @@ export async function uploadAreaPhoto(areaId, file, onProgress) {
 // =============================================
 
 /** Fetch all irrigation zones (sorted in JS to avoid index requirements) */
-export async function getIrrigationZones() {
+export function getIrrigationZones() { return whole('irrigationZones', fetchIrrigationZones); }
+async function fetchIrrigationZones() {
     const snap = await getDocs(collection(db, 'irrigationZones'));
     const zones = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     return zones.sort((a, b) => {
@@ -675,8 +868,7 @@ export async function deleteIrrigationZone(id) {
     const logsSnap = await getDocs(
         query(collection(db, 'irrigationLogs'), where('zoneId', '==', id))
     );
-    for (const d of logsSnap.docs) await deleteDoc(d.ref);
-    await deleteDoc(doc(db, 'irrigationZones', id));
+    await deleteTogether([...logsSnap.docs.map(d => d.ref), doc(db, 'irrigationZones', id)]);
 }
 
 // =============================================
@@ -684,7 +876,8 @@ export async function deleteIrrigationZone(id) {
 // =============================================
 
 /** Fetch all irrigation logs */
-export async function getIrrigationLogs() {
+export function getIrrigationLogs() { return whole('irrigationLogs', fetchIrrigationLogs); }
+async function fetchIrrigationLogs() {
     const snap = await getDocs(collection(db, 'irrigationLogs'));
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
@@ -733,7 +926,8 @@ export async function deleteIrrigationLog(id) {
 //  SUGGESTIONS  (improvement / wishlist list)
 // =============================================
 
-export async function getSuggestions() {
+export function getSuggestions() { return whole('suggestions', fetchSuggestions); }
+async function fetchSuggestions() {
     const q    = query(collection(db, 'suggestions'), orderBy('createdAt', 'asc'));
     const snap = await getDocs(q);
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -753,58 +947,11 @@ export async function deleteSuggestion(id) {
 // =============================================
 
 /**
- * Given a recurrence pattern and a YYYY-MM-DD start date, return the next
- * occurrence date as a YYYY-MM-DD string (always at least one unit ahead).
- */
-export function nextOccurrenceDate(recurrence, fromDateStr) {
-    const d = new Date(fromDateStr + 'T12:00:00');
-    if (recurrence.type === 'daily') {
-        d.setDate(d.getDate() + 1);
-    } else if (recurrence.type === 'weekly') {
-        const target = recurrence.dayOfWeek;
-        let ahead = target - d.getDay();
-        if (ahead <= 0) ahead += 7;
-        d.setDate(d.getDate() + ahead);
-    } else if (recurrence.type === 'monthly') {
-        const dom = recurrence.dayOfMonth || 1;
-        d.setMonth(d.getMonth() + 1);
-        d.setDate(Math.min(dom, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
-    }
-    return d.toISOString().slice(0, 10);
-}
-
-/**
- * Return the first (upcoming) occurrence date from today for a new recurring task.
- * For weekly tasks, returns today if today matches the target day.
- */
-export function firstOccurrenceFromToday(recurrence) {
-    const today = new Date();
-    today.setHours(12, 0, 0, 0);
-    if (recurrence.type === 'daily') {
-        return today.toISOString().slice(0, 10);
-    } else if (recurrence.type === 'weekly') {
-        const target = recurrence.dayOfWeek;
-        let ahead = target - today.getDay();
-        if (ahead < 0) ahead += 7;
-        today.setDate(today.getDate() + ahead);
-        return today.toISOString().slice(0, 10);
-    } else if (recurrence.type === 'monthly') {
-        const dom = recurrence.dayOfMonth || 1;
-        const thisMonth = new Date(today.getFullYear(), today.getMonth(), dom, 12);
-        if (thisMonth >= today) return thisMonth.toISOString().slice(0, 10);
-        const nextMonth = new Date(today.getFullYear(), today.getMonth() + 1, dom, 12);
-        return nextMonth.toISOString().slice(0, 10);
-    }
-    return today.toISOString().slice(0, 10);
-}
-
-/**
  * After a recurring assignment is completed or skipped, create the next occurrence.
  */
 export async function createNextRecurringOccurrence(assignment, task) {
     if (!task?.recurrence || task.recurrence.type === 'none') return;
-    const fromDate = assignment.occurrenceDate || assignment.dueDate
-                     || new Date().toISOString().slice(0, 10);
+    const fromDate = assignment.occurrenceDate || assignment.dueDate || todayStr();
     const nextDate = nextOccurrenceDate(task.recurrence, fromDate);
     return addTaskAssignment({
         taskId:         assignment.taskId,
@@ -885,25 +1032,8 @@ export async function deleteBlogPost(id) {
  * Returns { url, storagePath }.
  */
 export async function uploadBlogPhoto(postId, file, onProgress) {
-    const fileToUpload = await compressImage(file);
-    return new Promise((resolve, reject) => {
-        const ext        = file.name.split('.').pop();
-        const filename   = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-        const path       = `blog-photos/${postId}/${filename}`;
-        const storageRef = ref(storage, path);
-        const task       = uploadBytesResumable(storageRef, fileToUpload);
-        task.on('state_changed',
-            snap => {
-                const pct = (snap.bytesTransferred / snap.totalBytes) * 100;
-                if (onProgress) onProgress(pct);
-            },
-            err => reject(err),
-            async () => {
-                const url = await getDownloadURL(task.snapshot.ref);
-                resolve({ url, storagePath: path });
-            }
-        );
-    });
+    const { url, path } = await uploadToStorage('blog-photos', postId, file, onProgress);
+    return { url, storagePath: path };
 }
 
 // =============================================
@@ -989,59 +1119,24 @@ export async function clearAllData() {
 
 /** Return record counts for all collections */
 export async function getDataCounts() {
+    // Eight of these are plain counts, which the server can give without
+    // sending the documents. Instances and deceased plants are read in full
+    // because their quantities are added up.
+    const n = name => countOf(collection(db, name));
     const [p, a, i, ph, t, ta, iz, il, bp, dp] = await Promise.all([
-        getDocs(collection(db, 'plants')),
-        getDocs(collection(db, 'areas')),
-        getDocs(collection(db, 'instances')),
-        getDocs(collection(db, 'photos')),
-        getDocs(collection(db, 'tasks')),
-        getDocs(collection(db, 'taskAssignments')),
-        getDocs(collection(db, 'irrigationZones')),
-        getDocs(collection(db, 'irrigationLogs')),
-        getDocs(collection(db, 'blogPosts')),
-        getDocs(collection(db, 'deceasedPlants')),
+        n('plants'), n('areas'), getInstances(), n('photos'), n('tasks'),
+        n('taskAssignments'), n('irrigationZones'), n('irrigationLogs'),
+        n('blogPosts'), getDeceasedPlants(),
     ]);
-    const specimens = i.docs.reduce((sum, d) => sum + (d.data().quantity || 1), 0);
-    const composted = dp.docs.reduce((sum, d) => sum + (d.data().quantity || 1), 0);
+    const specimens = i.reduce((sum, d)  => sum + (d.quantity || 1), 0);
+    const composted = dp.reduce((sum, d) => sum + (d.quantity || 1), 0);
     return {
-        plants: p.size, areas: a.size, instances: i.size, specimens,
-        photos: ph.size, tasks: t.size, taskAssignments: ta.size,
-        irrigationZones: iz.size, irrigationLogs: il.size,
-        blogPosts: bp.size,
-        deceasedPlants: dp.size, composted,
+        plants: p, areas: a, instances: i.length, specimens,
+        photos: ph, tasks: t, taskAssignments: ta,
+        irrigationZones: iz, irrigationLogs: il,
+        blogPosts: bp,
+        deceasedPlants: dp.length, composted,
     };
-}
-
-// =============================================
-//  HELPERS
-// =============================================
-
-/** Build a display-ready botanical name string (HTML) */
-export function formatBotanicalName(plant) {
-    const ht = hybridTypeOf(plant);
-    let parts = [];
-    // Intergeneric hybrids place the × immediately before the genus (×Genus);
-    // interspecific hybrids place it before the species epithet (Genus × species).
-    if (plant.genus)      parts.push(ht === 'intergeneric' ? `×<em>${escHtml(plant.genus)}</em>` : `<em>${escHtml(plant.genus)}</em>`);
-    if (ht === 'interspecific' && plant.species) parts.push('×');
-    if (plant.species)    parts.push(`<em>${escHtml(plant.species)}</em>`);
-    if (plant.subspecies) parts.push(`subsp. <em>${escHtml(plant.subspecies)}</em>`);
-    if (plant.variety)    parts.push(`var. <em>${escHtml(plant.variety)}</em>`);
-    if (plant.cultivar)   parts.push(`'${escHtml(plant.cultivar)}'`);
-    if (plant.authority)  parts.push(escHtml(plant.authority));
-    return parts.join(' ');
-}
-
-/**
- * Effective hybrid type for a plant.
- * Returns 'interspecific' | 'intergeneric' | null.
- * Legacy records stored only a boolean `hybrid` — treat those as interspecific
- * (the common case; × before the species), which matches how the app rendered
- * them historically in the garden view.
- */
-export function hybridTypeOf(plant) {
-    if (plant && plant.hybridType) return plant.hybridType;
-    return (plant && plant.hybrid) ? 'interspecific' : null;
 }
 
 // =============================================
@@ -1054,7 +1149,8 @@ export function hybridTypeOf(plant) {
  *                    role, status, blocked, lastLoginAt, createdAt }
  * Requires admin read access on the users collection (see firestore.rules).
  */
-export async function getUsers() {
+export function getUsers() { return whole('users', fetchUsers); }
+async function fetchUsers() {
     const snap = await getDocs(collection(db, 'users'));
     return snap.docs.map(d => ({ uid: d.id, ...d.data() }));
 }
@@ -1091,64 +1187,11 @@ export async function setUserBlocked(uid, blocked) {
  * Used to drive the pending-users badge on the Admin nav tab.
  */
 export async function getPendingUserCount() {
-    const snap = await getDocs(collection(db, 'users'));
-    return snap.docs.filter(d => {
-        const data = d.data();
-        return !data.role && !data.blocked;
-    }).length;
+    // The users list is a handful of documents and the Admin panel wants it
+    // anyway, so this shares the one remembered read with getUsers().
+    return (await getUsers()).filter(u => !u.role && !u.blocked).length;
 }
 
-/** Simple HTML escape */
-export function escHtml(str) {
-    if (!str) return '';
-    return str
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
 
-// =============================================
-//  DATE HELPERS
-//  Added 2026-08-10. These lived as six separate local copies across
-//  tasks-view, garden-view, compost-view, irrigation-view and blog-view, and
-//  they disagreed: Tasks and Overview rendered "14 May 26" while the Compost
-//  Bin, Irrigation and the Blog rendered "14 May 2026". fmtDate is byte-identical
-//  to Nursery's in apps/nursery/js/db.js, so both apps now read the same.
-// =============================================
 
-const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const MONTHS_FULL  = ['January','February','March','April','May','June',
-                      'July','August','September','October','November','December'];
 
-/** Format a YYYY-MM-DD string as "14 Sep 26". The default for lists and rows. */
-export function fmtDate(dateStr) {
-    if (!dateStr) return '';
-    const [y, m, d] = dateStr.split('-').map(Number);
-    return `${d} ${MONTHS_SHORT[m - 1]} ${String(y).slice(2)}`;
-}
-
-/**
- * Format a YYYY-MM-DD string as "14 September 2026".
- * Only for prominent standalone dates — a blog post header — where the full
- * month and year read better and there is no density pressure. This is what
- * blog-view's formatDisplayDate produced via toLocaleDateString('en-GB'), kept
- * so journal entries look unchanged. Prefer fmtDate everywhere else.
- */
-export function fmtDateLong(dateStr) {
-    if (!dateStr) return '';
-    const [y, m, d] = dateStr.split('-').map(Number);
-    return `${d} ${MONTHS_FULL[m - 1]} ${y}`;
-}
-
-/** Today as YYYY-MM-DD */
-export function todayStr() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-
-/** True if a due date has passed and the task is not already completed. */
-export function isOverdue(dateStr, status) {
-    if (!dateStr || status === 'completed') return false;
-    return dateStr < todayStr();
-}

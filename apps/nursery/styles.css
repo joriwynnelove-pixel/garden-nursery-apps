@@ -578,7 +578,7 @@ textarea::placeholder {
 }
 .nav-btn {
     padding: 8px 2px;
-    font-size: 0.65rem;
+    font-size: 0.72rem;   /* was 0.65rem (10.4px): small for reading outdoors */
 }
 
 /* =============================================
@@ -1464,6 +1464,13 @@ textarea::placeholder {
     flex-shrink: 0;
     margin-left: 4px;
 }
+/* URLs in notes and descriptions, from linkify() in db.js. A long URL has
+   no spaces to break at, so without this it runs off a phone screen. */
+.text-link {
+    color: var(--green-700);
+    text-decoration: underline;
+    overflow-wrap: anywhere;
+}
 .outcome-notes {
     margin-top: 6px;
     padding-top: 6px;
@@ -1563,6 +1570,27 @@ textarea::placeholder {
     font-weight: 500;
 }
 .view-in-garden-link:hover { text-decoration: underline; }
+.garden-link-removed {
+    margin: 8px 0 0;
+    font-size: 0.82rem;
+    color: var(--grey-500);
+}
+
+/* Record outcome — which Garden plant a plant-out adds to */
+.garden-plant-choice-hint { margin: 0 0 4px; }
+.garden-plant-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+.garden-plant-option input { margin-top: 3px; flex-shrink: 0; }
+.garden-plant-option-common {
+    color: var(--grey-500);
+    font-size: 0.82rem;
+}
 
 /* ============================================================
    Log entry — location change chip
@@ -1793,3 +1821,29 @@ textarea::placeholder {
     70%  { box-shadow: 0 0 0 4px rgba(82,183,136,0.35); }
     100% { box-shadow: 0 0 0 0 rgba(82,183,136,0.0); }
 }
+
+/* =============================================
+   Tap targets and input text size, 2026-11
+   ============================================= */
+/* Everything here was under the 44px a finger needs. Where a control sits in
+   a tight row and growing it would break the layout, it keeps its size and an
+   invisible ::after takes the tap instead. */
+.btn-sm,
+.filter-tab,
+.filter-pill,
+.filter-chip,
+.sort-toggle-btn,
+.outcome-type-pill { min-height: 44px; }
+.filter-chip { min-width: 44px; justify-content: center; }
+
+.plan-status-btn,
+.wish-status-btn { position: relative; }
+.plan-status-btn::after,
+.wish-status-btn::after {
+    content: '';
+    position: absolute;
+    inset: -13px -4px;
+}
+
+/* 16px, so iPhone Safari does not zoom the page when a field is tapped. */
+.form-input, .form-select, .form-textarea, .plant-lookup-text { font-size: 1rem; }

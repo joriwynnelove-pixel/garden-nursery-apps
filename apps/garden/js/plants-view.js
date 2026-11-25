@@ -8,8 +8,9 @@ import {
     getInstances, getInstancesForPlant, addInstance, updateInstance, deleteInstance,
     getPhotosForPlant, uploadPhoto, deletePhoto, updatePhotoOrders, getPlantIdsWithPhotos,
     getDeceasedPlants, recordPlantDeath,
-    getNurseryLocations, transferToNursery,
-    formatBotanicalName, escHtml, ensureTagCode
+    getNurseryLocations, transferToNursery, countNurseryBatchesForPlant,
+    formatBotanicalName, escHtml, linkify, ensureTagCode, fmtDate,
+    plainPlantName, todayStr
 } from './db.js';
 import { showModal, hideModal, showToast, setLoading, navigate, goBack, initPhotoCarousel, datePicker, initDatePickers, initPhotoDragSort } from './ui-utils.js';
 import { isAtLeast } from './auth.js';
@@ -20,16 +21,6 @@ import { plantQrSvg, plantTagUrl, openTagSheet, openTapeLabels,
          tapeQrPlan, qrModulesAcross, TAPE_MARGIN_PINS,
          TAG_STOCK, DEFAULT_TAG_STOCK, tapeLabelPlan } from './qr.js';
 
-// Plain-text botanical name (strips the HTML that formatBotanicalName returns)
-function plainName(plant) {
-    return (formatBotanicalName(plant) || plant.commonName || 'Unnamed plant')
-        .replace(/<[^>]+>/g, '');
-}
-
-function todayISO() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
 
 // =============================================
 //  TAG / DROPDOWN OPTION LISTS
@@ -107,15 +98,23 @@ function tagBadgeRow(label, values) {
 //  PLANTS LIST
 // =============================================
 
-// Persists the last search query so Back navigation restores the filtered view.
-let savedPlantQuery = '';
+// What the list is showing. Kept here, outside the render, so that coming Back
+// from a plant restores the same search, filters and depth. main.js puts the
+// scroll position back after the render, which only works if at least as many
+// cards are drawn as were there before: that is what `shown` is for.
+const PLANT_PAGE = 60;
+const freshListState = () => ({ query: '', unplaced: false, noPhoto: false, areaId: '', shown: PLANT_PAGE,
+                               tags: {}, ownership: 'all' });   // tags/ownership: this fork's filter panel
+let listState = freshListState();
+let listObserver = null;
 
 /** Call this when navigating to Plants fresh (e.g. tapping the nav tab). */
-export function clearPlantSearch() { savedPlantQuery = ''; }
+export function clearPlantSearch() { listState = freshListState(); }
 
 export async function renderPlantsList(container, headerActionEl, backBtn) {
     setLoading(container, true);
     backBtn.classList.remove('visible');
+    listObserver?.disconnect();
 
     let plants = [], photoPlantIds = new Set(), instances = [], areas = [], deceased = [];
     try {
@@ -133,15 +132,19 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
     const deceasedPlantIds = new Set(deceased.map(d => d.plantId));
     plants = plants.filter(p => !(deceasedPlantIds.has(p.id) && !livingPlantIds.has(p.id)));
 
-    // Build plantId → area names map for location display
+    // Build plantId → area names (for the card) and area ids (for the filter)
     const areaNameMap = Object.fromEntries(areas.map(a => [a.id, a.name]));
     const plantAreaNames = {};
+    const plantAreaIds   = {};
     for (const inst of instances) {
         const name = areaNameMap[inst.areaId];
         if (!name) continue;
-        if (!plantAreaNames[inst.plantId]) plantAreaNames[inst.plantId] = [];
+        if (!plantAreaNames[inst.plantId]) { plantAreaNames[inst.plantId] = []; plantAreaIds[inst.plantId] = new Set(); }
         if (!plantAreaNames[inst.plantId].includes(name)) plantAreaNames[inst.plantId].push(name);
+        plantAreaIds[inst.plantId].add(inst.areaId);
     }
+    // An area filter left over from an area that has since been deleted
+    if (listState.areaId && !areaNameMap[listState.areaId]) listState.areaId = '';
 
     // Build FAB — editors and admins only
     headerActionEl.innerHTML = '';
@@ -156,28 +159,25 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
         document.body.appendChild(fab);
     }
 
-    // Restore the previous search query (empty when arriving via nav tab)
-    let query = savedPlantQuery;
     let debounceTimer = null;
 
-    // Tag filters — { type: [...], sunNeeds: [...], waterNeeds: [...], traits: [...], tolerances: [...] }
-    const activeFilters = Object.fromEntries(TAG_CATEGORIES.map(c => [c.key, []]));
-    let ownershipFilter = 'all'; // 'all' | 'owned' | 'wishlist'
+    // Tag + ownership filters live in listState (tags: { type: [...], sunNeeds: [...], … },
+    // ownership: 'all' | 'owned' | 'wishlist') so Back restores them with the rest.
     const activeFilterCount = () =>
-        Object.values(activeFilters).reduce((n, arr) => n + arr.length, 0) + (ownershipFilter !== 'all' ? 1 : 0);
+        Object.values(listState.tags).reduce((n, arr) => n + arr.length, 0) + (listState.ownership !== 'all' ? 1 : 0);
 
     container.innerHTML = `
         <div class="search-bar">
             <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <input class="search-input" id="plant-search" placeholder="Search by name, genus, species…"
-                   autocomplete="off" value="${query.replace(/"/g, '&quot;')}" style="padding-right:78px;">
+                   autocomplete="off" value="${escHtml(listState.query)}" style="padding-right:78px;">
             <button class="search-clear" id="search-clear-btn" title="Clear search" aria-label="Clear search">✕</button>
             <button class="filter-toggle-btn" id="plant-filter-toggle" title="Filter by tags" aria-label="Filter by tags">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
                 <span id="plant-filter-count" class="filter-count-badge" style="display:none;"></span>
             </button>
         </div>
-        <div id="plant-filter-panel" class="filter-panel" style="display:none;">
+        <div id="plant-filter-panel" class="filter-panel" style="${activeFilterCount() > 0 ? '' : 'display:none;'}">
             <div class="filter-group" id="ownership-filter-group">
                 <div class="filter-group-title">Ownership</div>
                 <div class="segmented-control" id="ownership-segmented">
@@ -190,33 +190,66 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
             ${TAG_CATEGORIES.map(cat => `
                 <div class="filter-group" data-category="${cat.key}">
                     <div class="filter-group-title">${escHtml(cat.label)}</div>
-                    ${pillSelectGroup(`flt-${cat.key}`, cat.options, [], `flt-${cat.key}`)}
+                    ${pillSelectGroup(`flt-${cat.key}`, cat.options, listState.tags[cat.key] || [], `flt-${cat.key}`)}
                 </div>
             `).join('')}
             <div style="display:flex;justify-content:flex-end;margin-top:4px;">
                 <button type="button" class="btn btn-sm btn-secondary" id="plant-filter-clear">Clear filters</button>
             </div>
         </div>
+        <div class="filter-chips plant-filters">
+            <button class="filter-chip" data-filter="unplaced" aria-pressed="false">Not placed</button>
+            <button class="filter-chip" data-filter="noPhoto" aria-pressed="false">No photo</button>
+            <select class="filter-chip plant-area-filter" id="plant-area-filter" aria-label="Show one area">
+                <option value="">All areas</option>
+                ${areas.map(a => `<option value="${escHtml(a.id)}">${escHtml(a.name)}</option>`).join('')}
+            </select>
+        </div>
         <div id="plant-results"></div>
+        <nav class="az-strip" id="az-strip" aria-label="Jump to a letter" hidden></nav>
     `;
 
+    const resultsEl   = container.querySelector('#plant-results');
+    const azStrip     = container.querySelector('#az-strip');
+    const searchInput = container.querySelector('#plant-search');
+    const clearBtn    = container.querySelector('#search-clear-btn');
+    const areaSelect  = container.querySelector('#plant-area-filter');
+    const chips       = [...container.querySelectorAll('.filter-chip[data-filter]')];
+
     const filtered = () => plants.filter(p => {
-        const q = query.toLowerCase().trim();
-        if (q) {
-            // Split into individual words so multi-word queries like "Acer palmatum"
-            // work across fields — every word must match at least one field,
-            // but each word can match a *different* field.
-            const words = q.split(/\s+/);
-            const fields = [
-                (p.genus       || '').toLowerCase(),
-                (p.species     || '').toLowerCase(),
-                (p.cultivar    || '').toLowerCase(),
-                (p.subspecies  || '').toLowerCase(),
-                (p.variety     || '').toLowerCase(),
-                (p.commonName  || '').toLowerCase(),
-            ];
-            if (!words.every(word => fields.some(field => field.includes(word)))) return false;
+        if (listState.unplaced && (plantAreaNames[p.id] || []).length) return false;
+        if (listState.noPhoto  && photoPlantIds.has(p.id))             return false;
+        if (listState.areaId   && !plantAreaIds[p.id]?.has(listState.areaId)) return false;
+
+        if (listState.ownership !== 'all') {
+            if (ownershipStatusFromAreas(plantAreaNames[p.id] || []) !== listState.ownership) return false;
         }
+
+        // Tag filters — within a category, a plant matches if it has ANY selected tag (OR).
+        // Across categories, a plant must match EVERY category that has an active selection (AND).
+        for (const cat of TAG_CATEGORIES) {
+            const selected = listState.tags[cat.key] || [];
+            if (selected.length === 0) continue;
+            const plantValues = Array.isArray(p[cat.key]) ? p[cat.key] : [];
+            if (!selected.some(v => plantValues.includes(v))) return false;
+        }
+
+        const q = listState.query.toLowerCase().trim();
+        if (!q) return true;
+
+        // Split into individual words so multi-word queries like "Acer palmatum"
+        // work across fields — every word must match at least one field,
+        // but each word can match a *different* field.
+        const words = q.split(/\s+/);
+        const fields = [
+            (p.genus       || '').toLowerCase(),
+            (p.species     || '').toLowerCase(),
+            (p.cultivar    || '').toLowerCase(),
+            (p.subspecies  || '').toLowerCase(),
+            (p.variety     || '').toLowerCase(),
+            (p.commonName  || '').toLowerCase(),
+        ];
+        return words.every(word => fields.some(field => field.includes(word)));
 
         if (ownershipFilter !== 'all') {
             if (ownershipStatusFromAreas(plantAreaNames[p.id] || []) !== ownershipFilter) return false;
@@ -234,60 +267,101 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
         return true;
     });
 
-    const renderResults = () => {
-        const list = filtered();
-        const resultsEl = container.querySelector('#plant-results');
-        if (!resultsEl) return;
+    // The list as currently filtered, and how many of its cards are drawn.
+    let list = [], drawn = 0;
+    const cardFor = p => plantCard(p, photoPlantIds.has(p.id), plantAreaNames[p.id] || []);
+
+    /** Draw cards up to (not including) index `upTo`. */
+    const drawTo = upTo => {
+        const grid = resultsEl.querySelector('#plant-grid');
+        upTo = Math.min(upTo, list.length);
+        if (!grid || upTo <= drawn) return;
+        grid.insertAdjacentHTML('beforeend', list.slice(drawn, upTo).map(cardFor).join(''));
+        drawn = upTo;
+        listState.shown = drawn;
+        if (drawn >= list.length) { listObserver?.disconnect(); resultsEl.querySelector('#plant-more')?.remove(); }
+    };
+
+    // The list is sorted by genus, so the first card of each initial letter is
+    // where that letter starts. Plants with no genus sort first, under "#".
+    const letterOf = p => { const c = (p.genus || '').trim().charAt(0).toUpperCase(); return c >= 'A' && c <= 'Z' ? c : '#'; };
+    const drawStrip = () => {
+        const starts = new Map();
+        list.forEach((p, i) => { const l = letterOf(p); if (!starts.has(l)) starts.set(l, i); });
+        // Worth having only when the list runs past the first page and spans letters
+        const show = list.length > PLANT_PAGE && starts.size > 1;
+        azStrip.hidden = !show;
+        [resultsEl, searchInput.parentElement, areaSelect.parentElement].forEach(el => el.classList.toggle('has-az', show));
+        azStrip.innerHTML = show
+            ? [...starts].map(([l, i]) => `<button type="button" data-index="${i}" aria-label="Jump to ${l === '#' ? 'plants with no genus' : l}">${l}</button>`).join('')
+            : '';
+    };
+    const jumpTo = index => {
+        drawTo(index + PLANT_PAGE);
+        const card = resultsEl.querySelector('#plant-grid')?.children[index];
+        if (!card) return;
+        const headerH = document.querySelector('.app-header')?.offsetHeight || 60;
+        window.scrollTo({ top: card.getBoundingClientRect().top + window.scrollY - headerH - 8, behavior: 'instant' });
+    };
+
+    /** Rebuild the results. `keepDepth` is true only for the first draw, when
+     *  coming Back wants as many cards as were showing before. */
+    const renderResults = (keepDepth = false) => {
+        list  = filtered();
+        drawn = 0;
+        listObserver?.disconnect();
+        const first = keepDepth ? Math.max(listState.shown, PLANT_PAGE) : PLANT_PAGE;
+        const narrowed = list.length !== plants.length;
+        const noun = n => `plant${n !== 1 ? 's' : ''}`;
 
         resultsEl.innerHTML = `
             <div class="list-header">
                 <span class="list-title">Plants</span>
-                <span class="list-count">${list.length} plant${list.length !== 1 ? 's' : ''}</span>
+                <span class="list-count">${narrowed ? `${list.length} of ${plants.length} ${noun(plants.length)}` : `${list.length} ${noun(list.length)}`}</span>
             </div>
             ${list.length === 0 ? `
                 <div class="empty-state">
                     <div class="empty-state-icon">🌱</div>
-                    <h3>${query || activeFilterCount() > 0 ? 'No plants found' : 'No plants yet'}</h3>
-                    <p>${query || activeFilterCount() > 0 ? 'Try a different search term or fewer filters.' : 'Tap the + button to add your first plant.'}</p>
+                    <h3>${narrowed ? 'No plants found' : 'No plants yet'}</h3>
+                    <p>${narrowed ? 'Try a different search, or clear a filter.' : 'Tap the + button to add your first plant.'}</p>
                 </div>
             ` : `
-                <div class="card-grid">
-                    ${list.map(p => plantCard(p, photoPlantIds.has(p.id), plantAreaNames[p.id] || [])).join('')}
-                </div>
+                <div class="card-grid" id="plant-grid"></div>
+                <div id="plant-more" class="plant-more" aria-hidden="true"></div>
             `}
         `;
+        drawTo(first);
+        drawStrip();
 
-        // Bind card clicks
-        resultsEl.querySelectorAll('.plant-card').forEach(card => {
-            card.addEventListener('click', () => navigate('plant-detail', card.dataset.id));
-        });
-
-        // Genus badge — filter to that genus without navigating into the card
-        resultsEl.querySelectorAll('.genus-badge').forEach(badge => {
-            badge.addEventListener('click', e => {
-                e.stopPropagation();
-                const genus = badge.dataset.genus;
-                query = genus;
-                savedPlantQuery = genus;
-                searchInput.value = genus;
-                syncClearBtn();
-                clearTimeout(debounceTimer);
-                renderResults();
-            });
-        });
+        // More cards arrive as the end of the list comes within a few screens.
+        const more = resultsEl.querySelector('#plant-more');
+        if (more && 'IntersectionObserver' in window) {
+            listObserver = new IntersectionObserver(entries => {
+                if (!entries.some(e => e.isIntersecting)) return;
+                drawTo(drawn + PLANT_PAGE);
+                // Still in view after that batch (a tall screen): ask again.
+                const again = resultsEl.querySelector('#plant-more');
+                if (again) { listObserver.unobserve(again); listObserver.observe(again); }
+            }, { rootMargin: '1200px 0px' });
+            listObserver.observe(more);
+        } else if (more) {
+            drawTo(list.length);        // no observer: draw everything, as before
+        }
     };
 
-    const searchInput = container.querySelector('#plant-search');
-    const clearBtn    = container.querySelector('#search-clear-btn');
-    const filterToggle = container.querySelector('#plant-filter-toggle');
-    const filterPanel  = container.querySelector('#plant-filter-panel');
+    const filterToggle  = container.querySelector('#plant-filter-toggle');
+    const filterPanel   = container.querySelector('#plant-filter-panel');
     const filterCountEl = container.querySelector('#plant-filter-count');
+    const ownershipSegmented = container.querySelector('#ownership-segmented');
 
     function syncFilterCount() {
         const n = activeFilterCount();
         filterToggle.classList.toggle('active', n > 0);
         filterCountEl.style.display = n > 0 ? 'flex' : 'none';
         filterCountEl.textContent = n;
+        ownershipSegmented.querySelectorAll('.segmented-option').forEach(b =>
+            b.classList.toggle('active', b.dataset.value === listState.ownership)
+        );
     }
 
     filterToggle.addEventListener('click', () => {
@@ -300,21 +374,16 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
         if (!cat) return; // the Ownership group has no checkboxes
         group.querySelectorAll('input[type="checkbox"]').forEach(cb => {
             cb.addEventListener('change', () => {
-                const checked = Array.from(group.querySelectorAll('input:checked')).map(c => c.value);
-                activeFilters[cat] = checked;
+                listState.tags[cat] = Array.from(group.querySelectorAll('input:checked')).map(c => c.value);
                 syncFilterCount();
                 renderResults();
             });
         });
     });
 
-    const ownershipSegmented = container.querySelector('#ownership-segmented');
     ownershipSegmented.querySelectorAll('.segmented-option').forEach(btn => {
         btn.addEventListener('click', () => {
-            ownershipFilter = btn.dataset.value;
-            ownershipSegmented.querySelectorAll('.segmented-option').forEach(b =>
-                b.classList.toggle('active', b === btn)
-            );
+            listState.ownership = btn.dataset.value;
             syncFilterCount();
             renderResults();
         });
@@ -322,43 +391,82 @@ export async function renderPlantsList(container, headerActionEl, backBtn) {
 
     container.querySelector('#plant-filter-clear').addEventListener('click', () => {
         filterPanel.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => cb.checked = false);
-        TAG_CATEGORIES.forEach(cat => activeFilters[cat.key] = []);
-        ownershipFilter = 'all';
-        ownershipSegmented.querySelectorAll('.segmented-option').forEach(b =>
-            b.classList.toggle('active', b.dataset.value === 'all')
-        );
+        listState.tags = {};
+        listState.ownership = 'all';
         syncFilterCount();
         renderResults();
     });
 
-    function syncClearBtn() {
+    const syncControls = () => {
+        syncFilterCount();
         clearBtn.style.display = searchInput.value ? 'flex' : 'none';
-    }
+        chips.forEach(c => {
+            const on = !!listState[c.dataset.filter];
+            c.classList.toggle('active', on);
+            c.setAttribute('aria-pressed', String(on));
+        });
+        areaSelect.value = listState.areaId;
+        areaSelect.classList.toggle('active', !!listState.areaId);
+    };
+    const refilter = () => {
+        syncControls();
+        clearTimeout(debounceTimer);
+        renderResults();
+        window.scrollTo({ top: 0, behavior: 'instant' });
+    };
 
-    // Show the clear button immediately if the search was restored from saved state
-    syncClearBtn();
+    // One listener for every card, however many are drawn.
+    resultsEl.addEventListener('click', e => {
+        // Genus badge — filter to that genus without navigating into the card
+        const badge = e.target.closest('.genus-badge');
+        if (badge) {
+            listState.query = badge.dataset.genus;
+            searchInput.value = listState.query;
+            refilter();
+            return;
+        }
+        const card = e.target.closest('.plant-card');
+        if (card) navigate('plant-detail', card.dataset.id);
+    });
+
+    // A–Z strip: tap a letter, or slide a finger down it.
+    const letterAt = (x, y) => document.elementFromPoint(x, y)?.closest?.('#az-strip button');
+    let lastLetter = null;
+    const strike = btn => {
+        if (!btn || btn === lastLetter) return;
+        lastLetter = btn;
+        jumpTo(Number(btn.dataset.index));
+    };
+    azStrip.addEventListener('pointerdown', e => { lastLetter = null; strike(e.target.closest('button')); });
+    azStrip.addEventListener('pointermove', e => { if (e.buttons || e.pointerType === 'touch') strike(letterAt(e.clientX, e.clientY)); });
+    azStrip.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); lastLetter = null; strike(e.target.closest('button')); }
+    });
+
+    chips.forEach(c => c.addEventListener('click', () => {
+        listState[c.dataset.filter] = !listState[c.dataset.filter];
+        refilter();
+    }));
+    areaSelect.addEventListener('change', () => { listState.areaId = areaSelect.value; refilter(); });
 
     // Debounced search — waits 300ms after last keystroke before filtering
     searchInput.addEventListener('input', e => {
-        query = e.target.value;
-        savedPlantQuery = query;   // persist so Back restores it
-        syncClearBtn();
+        listState.query = e.target.value;   // kept so Back restores it
+        clearBtn.style.display = searchInput.value ? 'flex' : 'none';
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(renderResults, 300);
+        debounceTimer = setTimeout(() => renderResults(), 300);
     });
 
     // Clear button — wipe the input, reset query, re-render immediately
     clearBtn.addEventListener('click', () => {
         searchInput.value = '';
-        query = '';
-        savedPlantQuery = '';
-        syncClearBtn();
-        clearTimeout(debounceTimer);
-        renderResults();
+        listState.query = '';
+        refilter();
         searchInput.focus();
     });
 
-    renderResults();
+    syncControls();
+    renderResults(true);
     setLoading(container, false);
 }
 
@@ -385,7 +493,7 @@ function plantCard(plant, hasPhotos = false, areaNames = []) {
                     ${Array.isArray(plant.type) && plant.type.length ? plant.type.map(t =>
                         `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);">${escHtml(t)}</span>`
                     ).join('') : ''}
-                    ${plant.dateAcquired ? `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);">📅 ${escHtml(plant.dateAcquired)}</span>` : ''}
+                    ${plant.dateAcquired ? `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);">📅 ${escHtml(fmtDate(plant.dateAcquired))}</span>` : ''}
                     ${hasPhotos ? `<span class="card-badge" style="background:var(--grey-100);color:var(--grey-600);" title="Has photos">📷</span>` : ''}
                 </div>
                 ${locationLine}
@@ -458,7 +566,15 @@ export async function renderPlantDetail(container, headerActionEl, backBtn, plan
 
     // Delete plant (admin only)
     container.querySelector('#delete-plant-btn')?.addEventListener('click', async () => {
-        if (!confirm(`Delete "${formatBotanicalName(plant).replace(/<[^>]+>/g,'')}"? This cannot be undone.`)) return;
+        // Say how many Nursery batches link to this plant. They survive the delete
+        // with their own name and details; only the link stops working. If the
+        // count can't be read, ask without it rather than block the delete.
+        let linked = 0;
+        try { linked = await countNurseryBatchesForPlant(plantId); } catch (_) { /* ask without the count */ }
+        const batchNote = linked
+            ? `\n\n${linked} nursery batch${linked === 1 ? ' links' : 'es link'} to this plant. ${linked === 1 ? 'It keeps' : 'They keep'} the name and details stored on the batch, but the link to this plant will stop working.`
+            : '';
+        if (!confirm(`Delete "${formatBotanicalName(plant).replace(/<[^>]+>/g,'')}"? This cannot be undone.${batchNote}`)) return;
         try {
             await deletePlant(plantId);
             showToast('Plant deleted', 'success');
@@ -601,7 +717,7 @@ function buildPlantDetailHTML(plant, instances, photos) {
         ['Variety',      plant.variety],
         ['Authority',    plant.authority],
         ['Common name',  plant.commonName],
-        ['Date acquired', plant.dateAcquired],
+        ['Date acquired', fmtDate(plant.dateAcquired)],
         ['Height at maturity', plant.height],
         ['Width at maturity', plant.width],
     ].filter(([, v]) => v);
@@ -625,7 +741,6 @@ function buildPlantDetailHTML(plant, instances, photos) {
                 <span>${instances.length} specimen${instances.length !== 1 ? 's' : ''} recorded</span>
             </div>
         </div>
-
 
 
         <!-- Nomenclature -->
@@ -655,13 +770,13 @@ function buildPlantDetailHTML(plant, instances, photos) {
             ${plant.notes ? `
                 <div class="field-row">
                     <span class="field-label">Notes / Observations</span>
-                    <span class="field-value">${escHtml(plant.notes)}</span>
+                    <span class="field-value">${linkify(plant.notes)}</span>
                 </div>
             ` : ''}
             ${plant.careReminders ? `
                 <div class="field-row">
                     <span class="field-label">Care reminders</span>
-                    <span class="field-value">${escHtml(plant.careReminders)}</span>
+                    <span class="field-value">${linkify(plant.careReminders)}</span>
                 </div>
             ` : ''}
         </div>
@@ -737,10 +852,10 @@ function instanceRow(inst) {
     const areaName = inst.area ? escHtml(inst.area.name) : 'Unknown area';
     const details  = [
         inst.quantity > 1 ? `${inst.quantity} plants` : null,
-        inst.datePlanted ? `Planted ${inst.datePlanted}` : null,
+        inst.datePlanted ? `Planted ${escHtml(fmtDate(inst.datePlanted))}` : null,
         inst.lastSeen    ? `Seen ${escHtml(inst.lastSeen)}` : null,
         inst.notFoundOn  ? `⚠ Not found ${escHtml(inst.notFoundOn)}` : null,
-        inst.notes ? escHtml(inst.notes) : null,
+        inst.notes ? linkify(inst.notes) : null,
     ].filter(Boolean);
 
     return `
@@ -769,7 +884,7 @@ function instanceRow(inst) {
 export function showDeathModal(plant, instance, onSave) {
     const had      = instance.quantity || 1;
     const areaName = instance.area ? instance.area.name : 'Unknown area';
-    const pName    = plainName(plant);
+    const pName    = plainPlantName(plant);
 
     const causeOpts = DEATH_CAUSES.map(c =>
         `<option value="${c.key}">${c.icon}  ${escHtml(c.label)}</option>`
@@ -796,7 +911,7 @@ export function showDeathModal(plant, instance, onSave) {
             </div>
             <div class="form-group">
                 <label class="form-label" for="death-date">Date of death</label>
-                <input class="form-input" type="date" id="death-date" name="diedDate" value="${todayISO()}">
+                <input class="form-input" type="date" id="death-date" name="diedDate" value="${todayStr()}">
             </div>
             <div class="form-group">
                 <label class="form-label" for="death-notes">Notes <span class="optional">optional</span></label>
@@ -829,7 +944,7 @@ export function showDeathModal(plant, instance, onSave) {
             quantity:   qty,
             cause,
             notes:      (fd.get('notes') || '').trim(),
-            diedDate:   fd.get('diedDate') || todayISO(),
+            diedDate:   fd.get('diedDate') || todayStr(),
         };
 
         const saveBtn = document.getElementById('death-save-btn');
@@ -878,7 +993,7 @@ const NURSERY_STAGES = {
 async function showTransferModal(plant, instance, onSave) {
     const had      = instance.quantity || 1;
     const areaName = instance.area ? instance.area.name : 'Unknown area';
-    const pName    = plainName(plant);
+    const pName    = plainPlantName(plant);
 
     // Nursery locations for the picker (may be empty if none set up yet).
     let locations = [];
@@ -924,7 +1039,7 @@ async function showTransferModal(plant, instance, onSave) {
             </div>
             <div class="form-group">
                 <label class="form-label" for="transfer-date">Date moved</label>
-                <input class="form-input" type="date" id="transfer-date" name="startDate" value="${todayISO()}">
+                <input class="form-input" type="date" id="transfer-date" name="startDate" value="${todayStr()}">
             </div>
             <div class="form-group">
                 <label class="form-label" for="transfer-notes">Notes <span class="optional">optional</span></label>
@@ -949,7 +1064,7 @@ async function showTransferModal(plant, instance, onSave) {
         const method = fd.get('method') || 'division';
         const stage  = fd.get('stage')  || 'propagating';
         const notes  = (fd.get('notes') || '').trim();
-        const startDate  = fd.get('startDate') || todayISO();
+        const startDate  = fd.get('startDate') || todayStr();
         const locationId = fd.get('locationId') || null;
 
         // Build a nursery_batches document compatible with the Nursery app schema.
@@ -1822,7 +1937,7 @@ async function showPlantTagModal(plant) {
 
     document.getElementById('qr-print-btn')?.addEventListener('click', () => {
         hideModal();
-        openTagSheet([{ plant, note: '' }], plainName(plant));
+        openTagSheet([{ plant, note: '' }], plainPlantName(plant));
     });
 
     // Live read-out of how the code lands on the chosen tape. The number that
